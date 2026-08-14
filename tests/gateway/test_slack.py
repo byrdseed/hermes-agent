@@ -2939,6 +2939,40 @@ class TestReactions:
         # Message ID should be cleaned up
         assert "1234567890.000001" not in adapter._reacting_message_ids
 
+    @pytest.mark.asyncio
+    async def test_free_response_channel_message_is_registered_for_reactions(
+        self, adapter
+    ):
+        adapter.config.extra["free_response_channels"] = "C123"
+        event = {
+            "text": "hello",
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000002",
+        }
+
+        await adapter._handle_slack_message(event)
+
+        assert "1234567890.000002" in adapter._reacting_message_ids
+
+    @pytest.mark.asyncio
+    async def test_unmentioned_group_dm_is_not_registered_for_reactions(
+        self, adapter
+    ):
+        adapter.config.extra["require_mention"] = False
+        event = {
+            "text": "hello everyone",
+            "user": "U_USER",
+            "channel": "G123",
+            "channel_type": "mpim",
+            "ts": "1234567890.000003",
+        }
+
+        await adapter._handle_slack_message(event)
+
+        assert "1234567890.000003" not in adapter._reacting_message_ids
+
 
 # ---------------------------------------------------------------------------
 # TestThreadReplyHandling

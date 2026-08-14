@@ -266,9 +266,12 @@ def test_reaction_guard_pinned_to_production_expression():
     # The public method is a thin claim-release guard; the production
     # expression lives in the impl.
     src = inspect.getsource(SlackAdapter._handle_slack_message_impl)
-    assert "(is_one_to_one_dm or is_mentioned)" in src, (
-        "reaction guard no longer keys off is_one_to_one_dm — an unmentioned "
-        "MPIM would react again (regression of the group-DM fix)"
+    assert "_free_response = (\n            not is_dm" in src, (
+        "free-response reactions must exclude both 1:1 and group DMs"
+    )
+    assert "is_one_to_one_dm or is_mentioned or _free_response" in src, (
+        "reaction guard must cover 1:1 DMs, direct mentions, and accepted "
+        "free-response channel messages"
     )
     assert "(is_dm or is_mentioned)" not in src, (
         "reaction guard reverted to is_dm — MPIMs would react when unmentioned"
