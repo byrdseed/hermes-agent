@@ -907,6 +907,8 @@ class SlackAdapter(BasePlatformAdapter):
         # Bounded like the sibling caches (grows per DM — DM channel IDs are
         # per-user).
         self._channel_name_cache: Dict[Tuple[str, str], str] = {}
+        self._channel_context_cache: Dict[Tuple[str, str], Optional[str]] = {}
+        self._channel_info_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
         self._CHANNEL_NAME_CACHE_MAX = 5000
         # (team_id, user_id) → Slack bot identity, same workspace scoping as
         # the name cache. Used to catch peer-agent posts that arrive as plain
@@ -3846,37 +3848,83 @@ class SlackAdapter(BasePlatformAdapter):
         team_id = str(team_id or self._channel_team.get(channel_id, ""))
         cache_key = (team_id, str(channel_id))
         cached = self._channel_name_cache.get(cache_key)
-        if cached is not None:
+        if cached is not None and cache_key in self._channel_context_cache:
             return cached
         if not self._app:
             return channel_id
+        lock = self._channel_info_locks.setdefault(cache_key, asyncio.Lock())
         try:
-            resp = await self._get_client(
-                channel_id, team_id=team_id or None
-            ).conversations_info(channel=channel_id)
-            if not isinstance(resp, dict) or not resp.get("ok"):
-                name = channel_id
-            else:
-                ch = resp.get("channel") or {}
-                if ch.get("is_im"):
-                    peer_user = ch.get("user", "")
-                    name = (
-                        await self._resolve_user_name(
-                            peer_user, chat_id=channel_id, team_id=team_id
-                        )
-                        if peer_user
-                        else channel_id
+            async with lock:
+                cached = self._channel_name_cache.get(cache_key)
+                if cached is not None and cache_key in self._channel_context_cache:
+                    return cached
+                try:
+                    resp = await self._get_client(
+                        channel_id, team_id=team_id or None
+                    ).conversations_info(channel=channel_id)
+                    if not isinstance(resp, dict) or not resp.get("ok"):
+                        name = channel_id
+                        channel_context = None
+                    else:
+                        ch = resp.get("channel") or {}
+                        if ch.get("is_im"):
+                            peer_user = ch.get("user", "")
+                            name = (
+                                await self._resolve_user_name(
+                                    peer_user, chat_id=channel_id, team_id=team_id
+                                )
+                                if peer_user
+                                else channel_id
+                            )
+                            channel_context = None
+                        else:
+                            name = (
+                                ch.get("name")
+                                or ch.get("name_normalized")
+                                or channel_id
+                            )
+                            topic = str(
+                                (ch.get("topic") or {}).get("value") or ""
+                            ).strip()[:100]
+                            purpose = str(
+                                (ch.get("purpose") or {}).get("value") or ""
+                            ).strip()[:100]
+                            context_lines = []
+                            if topic:
+                                context_lines.append(f"Topic: {topic}")
+                            if purpose:
+                                context_lines.append(f"Purpose: {purpose}")
+                            channel_context = "\n".join(context_lines) or None
+                except Exception as e:
+                    logger.debug(
+                        "[Slack] conversations.info failed for %s: %s",
+                        channel_id,
+                        e,
                     )
-                else:
-                    name = ch.get("name") or ch.get("name_normalized") or channel_id
-        except Exception as e:
-            logger.debug("[Slack] conversations.info failed for %s: %s", channel_id, e)
-            name = channel_id
-        self._channel_name_cache[cache_key] = name
-        self._trim_oldest_dict_entries(
-            self._channel_name_cache, self._CHANNEL_NAME_CACHE_MAX
-        )
-        return name
+                    name = channel_id
+                    channel_context = None
+                self._channel_name_cache[cache_key] = name
+                self._channel_context_cache[cache_key] = channel_context
+                self._trim_oldest_dict_entries(
+                    self._channel_name_cache, self._CHANNEL_NAME_CACHE_MAX
+                )
+                self._trim_oldest_dict_entries(
+                    self._channel_context_cache, self._CHANNEL_NAME_CACHE_MAX
+                )
+                return name
+        finally:
+            if self._channel_info_locks.get(cache_key) is lock:
+                self._channel_info_locks.pop(cache_key, None)
+
+    async def _resolve_channel_context(
+        self, channel_id: str, team_id: str = ""
+    ) -> Optional[str]:
+        """Return cached Slack topic and purpose as untrusted channel context."""
+        team_id = str(team_id or self._channel_team.get(channel_id, ""))
+        cache_key = (team_id, str(channel_id))
+        if cache_key not in self._channel_context_cache:
+            await self._resolve_channel_name(channel_id, team_id=team_id)
+        return self._channel_context_cache.get(cache_key)
 
     async def _humanize_user_mentions(
         self, text: str, chat_id: str = "", team_id: str = ""
@@ -6188,6 +6236,9 @@ class SlackAdapter(BasePlatformAdapter):
         # Resolve channel display name (cached after first lookup) so logs
         # and agent context show #channel / peer names instead of raw IDs.
         channel_name = await self._resolve_channel_name(channel_id, team_id=team_id)
+        channel_context_label = await self._resolve_channel_context(
+            channel_id, team_id=team_id
+        )
 
         # Slack's AI Agent Messages tab shows visible app threads; title the
         # first DM thread turn from the user's prompt when Slack AI APIs are
@@ -6208,6 +6259,7 @@ class SlackAdapter(BasePlatformAdapter):
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_ts,
+            chat_topic=channel_context_label,
             scope_id=str(team_id) if team_id else None,
             # Slack Workflow Builder / app posts arrive as
             # subtype=bot_message with user=None; flag them so the
@@ -7731,11 +7783,17 @@ class SlackAdapter(BasePlatformAdapter):
                 user_id,
             )
             return
+        channel_name = await self._resolve_channel_name(channel_id, team_id=team_id)
+        channel_context_label = await self._resolve_channel_context(
+            channel_id, team_id=team_id
+        )
         source = self.build_source(
             chat_id=channel_id,
+            chat_name=channel_name,
             chat_type="dm" if is_dm else "group",
             user_id=user_id,
             thread_id=thread_id,
+            chat_topic=channel_context_label,
             scope_id=team_id or None,
         )
 
