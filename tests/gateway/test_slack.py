@@ -2796,6 +2796,24 @@ class TestSlackChannelMetadata:
 
         assert await adapter._resolve_channel_context("C123", "T123") == "new.md"
 
+    @pytest.mark.asyncio
+    async def test_failed_refresh_preserves_stale_topic_and_uses_retry_cooldown(
+        self, adapter
+    ):
+        adapter._app.client.conversations_info = AsyncMock(
+            return_value={
+                "ok": True,
+                "channel": {"name": "curriculum", "topic": {"value": "old.md"}},
+            }
+        )
+        await adapter._resolve_channel_name("C123", "T123")
+        adapter._channel_info_cache_times[("T123", "C123")] = 0
+        adapter._app.client.conversations_info.side_effect = RuntimeError("temporary")
+
+        assert await adapter._resolve_channel_context("C123", "T123") == "old.md"
+        assert await adapter._resolve_channel_context("C123", "T123") == "old.md"
+        assert adapter._app.client.conversations_info.await_count == 2
+
     def test_context_file_read_is_bounded(self, adapter, tmp_path):
         adapter.config.extra["channel_context_dir"] = str(tmp_path)
         (tmp_path / "large.md").write_text("x" * 30_000, encoding="utf-8")
@@ -2818,6 +2836,16 @@ class TestSlackChannelMetadata:
         (tmp_path / "linked.md").symlink_to(outside)
 
         assert adapter._load_topic_context_file("linked.md") is None
+
+    def test_symlinked_context_directory_is_ignored(self, adapter, tmp_path):
+        real_root = tmp_path / "real"
+        real_root.mkdir()
+        (real_root / "outside.md").write_text("must not load", encoding="utf-8")
+        linked_root = tmp_path / "linked-root"
+        linked_root.symlink_to(real_root, target_is_directory=True)
+        adapter.config.extra["channel_context_dir"] = str(linked_root)
+
+        assert adapter._load_topic_context_file("outside.md") is None
 
 
 # ---------------------------------------------------------------------------
