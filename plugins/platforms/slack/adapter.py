@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import stat
 import time
 import unicodedata
 from dataclasses import dataclass, field
@@ -1157,6 +1158,9 @@ class SlackAdapter(BasePlatformAdapter):
         # Bounded like the sibling caches (grows per DM — DM channel IDs are
         # per-user).
         self._channel_name_cache: Dict[Tuple[str, str], str] = {}
+        self._channel_context_cache: Dict[Tuple[str, str], Optional[str]] = {}
+        self._channel_info_cache_times: Dict[Tuple[str, str], float] = {}
+        self._channel_info_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
         self._CHANNEL_NAME_CACHE_MAX = 5000
         # (team_id, user_id) → Slack bot identity, same workspace scoping as
         # the name cache. Used to catch peer-agent posts that arrive as plain
@@ -4559,6 +4563,14 @@ class SlackAdapter(BasePlatformAdapter):
                 del self._user_name_cache[old_key]
         return name
 
+    def _channel_info_cache_ttl(self) -> float:
+        """Seconds before Slack channel name/topic metadata is refreshed."""
+        try:
+            configured = float(self.config.extra.get("channel_info_ttl_seconds", 300))
+        except (TypeError, ValueError):
+            configured = 300.0
+        return max(5.0, min(configured, 3600.0))
+
     async def _resolve_channel_name(
         self, channel_id: str, team_id: str = ""
     ) -> str:
@@ -4574,38 +4586,125 @@ class SlackAdapter(BasePlatformAdapter):
         team_id = str(team_id or self._channel_team.get(channel_id, ""))
         cache_key = (team_id, str(channel_id))
         cached = self._channel_name_cache.get(cache_key)
-        if cached is not None:
+        cache_age = time.monotonic() - self._channel_info_cache_times.get(cache_key, 0)
+        if (
+            cached is not None
+            and cache_key in self._channel_context_cache
+            and cache_age < self._channel_info_cache_ttl()
+        ):
             return cached
         if not self._app:
             return channel_id
+        lock = self._channel_info_locks.setdefault(cache_key, asyncio.Lock())
         try:
-            resp = await self._get_client(
-                channel_id, team_id=team_id or None
-            ).conversations_info(channel=channel_id)
-            payload = _slack_response_payload(resp)
-            if not payload.get("ok"):
-                name = channel_id
-            else:
-                ch = payload.get("channel") or {}
-                if ch.get("is_im"):
-                    peer_user = ch.get("user", "")
-                    name = (
-                        await self._resolve_user_name(
-                            peer_user, chat_id=channel_id, team_id=team_id
-                        )
-                        if peer_user
-                        else channel_id
+            async with lock:
+                cached = self._channel_name_cache.get(cache_key)
+                cache_age = time.monotonic() - self._channel_info_cache_times.get(
+                    cache_key, 0
+                )
+                if (
+                    cached is not None
+                    and cache_key in self._channel_context_cache
+                    and cache_age < self._channel_info_cache_ttl()
+                ):
+                    return cached
+                try:
+                    resp = await self._get_client(
+                        channel_id, team_id=team_id or None
+                    ).conversations_info(channel=channel_id)
+                    payload = _slack_response_payload(resp)
+                    if not payload.get("ok"):
+                        name = channel_id
+                        channel_context = None
+                    else:
+                        ch = payload.get("channel") or {}
+                        if ch.get("is_im"):
+                            peer_user = ch.get("user", "")
+                            name = (
+                                await self._resolve_user_name(
+                                    peer_user, chat_id=channel_id, team_id=team_id
+                                )
+                                if peer_user
+                                else channel_id
+                            )
+                            channel_context = None
+                        else:
+                            name = (
+                                ch.get("name")
+                                or ch.get("name_normalized")
+                                or channel_id
+                            )
+                            channel_context = str(
+                                (ch.get("topic") or {}).get("value") or ""
+                            ).strip() or None
+                except Exception as e:
+                    logger.debug(
+                        "[Slack] conversations.info failed for %s: %s",
+                        channel_id,
+                        e,
                     )
-                else:
-                    name = ch.get("name") or ch.get("name_normalized") or channel_id
-        except Exception as e:
-            logger.debug("[Slack] conversations.info failed for %s: %s", channel_id, e)
-            name = channel_id
-        self._channel_name_cache[cache_key] = name
-        self._trim_oldest_dict_entries(
-            self._channel_name_cache, self._CHANNEL_NAME_CACHE_MAX
-        )
-        return name
+                    name = channel_id
+                    channel_context = None
+                self._channel_name_cache[cache_key] = name
+                self._channel_context_cache[cache_key] = channel_context
+                self._channel_info_cache_times[cache_key] = time.monotonic()
+                self._trim_oldest_dict_entries(
+                    self._channel_name_cache, self._CHANNEL_NAME_CACHE_MAX
+                )
+                self._trim_oldest_dict_entries(
+                    self._channel_context_cache, self._CHANNEL_NAME_CACHE_MAX
+                )
+                self._trim_oldest_dict_entries(
+                    self._channel_info_cache_times, self._CHANNEL_NAME_CACHE_MAX
+                )
+                return name
+        finally:
+            if self._channel_info_locks.get(cache_key) is lock:
+                self._channel_info_locks.pop(cache_key, None)
+
+    async def _resolve_channel_context(
+        self, channel_id: str, team_id: str = ""
+    ) -> Optional[str]:
+        """Return the cached Slack topic as untrusted channel context."""
+        team_id = str(team_id or self._channel_team.get(channel_id, ""))
+        cache_key = (team_id, str(channel_id))
+        await self._resolve_channel_name(channel_id, team_id=team_id)
+        return self._channel_context_cache.get(cache_key)
+
+    def _load_topic_context_file(self, topic: Optional[str]) -> Optional[str]:
+        """Load a topic-named Markdown file from the configured safe directory."""
+        root_value = str(self.config.extra.get("channel_context_dir") or "").strip()
+        filename = str(topic or "").strip()
+        if not root_value or not filename or _Path(filename).name != filename:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,199}\.md", filename, re.IGNORECASE):
+            return None
+        root_fd = -1
+        fd = -1
+        try:
+            root = _Path(root_value).expanduser().resolve()
+            root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            root_fd = os.open(root, root_flags)
+            file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(
+                os, "O_NONBLOCK", 0
+            )
+            fd = os.open(filename, file_flags, dir_fd=root_fd)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                fd = -1
+                content = handle.read(20_001)
+        except (OSError, UnicodeError, ValueError, RuntimeError) as e:
+            logger.warning("[Slack] Could not load channel context file %s: %s", filename, e)
+            return None
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if root_fd >= 0:
+                os.close(root_fd)
+        if len(content) > 20_000:
+            content = content[:20_000].rstrip() + "\n\n[Context file truncated]"
+        return f"[Channel context: {filename}]\n{content.strip()}"
 
     async def _humanize_user_mentions(
         self, text: str, chat_id: str = "", team_id: str = ""
@@ -7066,6 +7165,7 @@ class SlackAdapter(BasePlatformAdapter):
                 if _channel_prompt
                 else _identity_prompt
             )
+        _topic_context_prompt = self._load_topic_context_file(channel_context_label)
         _auto_skill = resolve_channel_skills(
             self.config.extra,
             channel_id,
@@ -7093,6 +7193,7 @@ class SlackAdapter(BasePlatformAdapter):
             media_types=media_types,
             reply_to_message_id=thread_ts if thread_ts != ts else None,
             channel_prompt=_channel_prompt,
+            auto_context=_topic_context_prompt,
             channel_context=channel_context,
             # thread_ts identifies the thread root, not an explicit reply;
             # channel_context hydrates the root separately.
@@ -8548,6 +8649,8 @@ class SlackAdapter(BasePlatformAdapter):
             scope_id=team_id or None,
         )
 
+        _topic_context_prompt = self._load_topic_context_file(channel_context_label)
+
         event = MessageEvent(
             text=text,
             message_type=(
@@ -8555,6 +8658,7 @@ class SlackAdapter(BasePlatformAdapter):
             ),
             source=source,
             raw_message=command,
+            auto_context=_topic_context_prompt,
         )
 
         # Stash the Slack response_url so the first reply for this

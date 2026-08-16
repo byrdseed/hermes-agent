@@ -267,6 +267,38 @@ class TestSlashCommandSessionIsolation:
         assert event.source.user_id == "U123"
         assert event.source.scope_id == "T123"
 
+    @pytest.mark.asyncio
+    async def test_channel_slash_command_includes_channel_context(
+        self, adapter, tmp_path
+    ):
+        adapter.config.extra["channel_context_dir"] = str(tmp_path)
+        (tmp_path / "curriculum.md").write_text(
+            "# Curriculum\nHandle curriculum work here.", encoding="utf-8"
+        )
+        adapter._app.client.conversations_info = AsyncMock(
+            return_value={
+                "ok": True,
+                "channel": {
+                    "name": "curriculum",
+                    "topic": {"value": "curriculum.md"},
+                    "purpose": {"value": "Ignored"},
+                },
+            }
+        )
+        command = {
+            "text": "hello",
+            "user_id": "U123",
+            "channel_id": "C123",
+            "team_id": "T123",
+        }
+
+        await adapter._handle_slash_command(command)
+
+        message = adapter.handle_message.await_args.args[0]
+        assert message.source.chat_name == "curriculum"
+        assert message.source.chat_topic == "curriculum.md"
+        assert "# Curriculum\nHandle curriculum work here." in message.auto_context
+
 
 class TestSlackWorkspaceCollisionIsolation:
     @pytest.mark.asyncio
@@ -2972,6 +3004,136 @@ class TestReactions:
         await adapter._handle_slack_message(event)
 
         assert "1234567890.000003" not in adapter._reacting_message_ids
+
+
+class TestSlackChannelMetadata:
+    @pytest.mark.asyncio
+    async def test_topic_markdown_file_is_loaded_as_new_session_context(
+        self, adapter, tmp_path
+    ):
+        adapter.config.extra["free_response_channels"] = "C123"
+        adapter.config.extra["channel_context_dir"] = str(tmp_path)
+        (tmp_path / "curriculum.md").write_text(
+            "# Curriculum\nHandle curriculum work here.", encoding="utf-8"
+        )
+        adapter._app.client.conversations_info = AsyncMock(
+            return_value={
+                "ok": True,
+                "channel": {
+                    "name": "curriculum",
+                    "topic": {"value": "curriculum.md"},
+                    "purpose": {"value": "Ignored"},
+                },
+            }
+        )
+        event = {
+            "text": "hello",
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000004",
+        }
+
+        await adapter._handle_slack_message(event)
+
+        message = adapter.handle_message.await_args.args[0]
+        source = message.source
+        assert source.chat_name == "curriculum"
+        assert source.chat_topic == "curriculum.md"
+        assert "# Curriculum\nHandle curriculum work here." in message.auto_context
+        assert "# Curriculum" not in (message.channel_prompt or "")
+
+    @pytest.mark.asyncio
+    async def test_topic_cannot_escape_channel_context_directory(
+        self, adapter, tmp_path
+    ):
+        adapter.config.extra["free_response_channels"] = "C123"
+        adapter.config.extra["channel_context_dir"] = str(tmp_path)
+        outside = tmp_path.parent / "outside.md"
+        outside.write_text("must not load", encoding="utf-8")
+        adapter._app.client.conversations_info = AsyncMock(
+            return_value={
+                "ok": True,
+                "channel": {
+                    "name": "curriculum",
+                    "topic": {"value": "../outside.md"},
+                },
+            }
+        )
+
+        await adapter._handle_slack_message(
+            {
+                "text": "hello",
+                "user": "U_USER",
+                "channel": "C123",
+                "channel_type": "channel",
+                "ts": "1234567890.000005",
+            }
+        )
+
+        message = adapter.handle_message.await_args.args[0]
+        assert message.source.chat_topic == "../outside.md"
+        assert "must not load" not in (message.channel_prompt or "")
+
+    @pytest.mark.asyncio
+    async def test_concurrent_first_messages_share_channel_info_lookup(self, adapter):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def channel_info(**_kwargs):
+            started.set()
+            await release.wait()
+            return {"ok": True, "channel": {"name": "curriculum"}}
+
+        adapter._app.client.conversations_info = AsyncMock(side_effect=channel_info)
+        first = asyncio.create_task(adapter._resolve_channel_name("C123", "T123"))
+        await started.wait()
+        second = asyncio.create_task(adapter._resolve_channel_name("C123", "T123"))
+        await asyncio.sleep(0)
+        release.set()
+
+        assert await asyncio.gather(first, second) == ["curriculum", "curriculum"]
+        adapter._app.client.conversations_info.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_expired_channel_info_refreshes_topic(self, adapter):
+        adapter._app.client.conversations_info = AsyncMock(
+            return_value={
+                "ok": True,
+                "channel": {"name": "curriculum", "topic": {"value": "old.md"}},
+            }
+        )
+        await adapter._resolve_channel_name("C123", "T123")
+        adapter._channel_info_cache_times[("T123", "C123")] = 0
+        adapter._app.client.conversations_info.return_value = {
+            "ok": True,
+            "channel": {"name": "curriculum", "topic": {"value": "new.md"}},
+        }
+
+        assert await adapter._resolve_channel_context("C123", "T123") == "new.md"
+
+    def test_context_file_read_is_bounded(self, adapter, tmp_path):
+        adapter.config.extra["channel_context_dir"] = str(tmp_path)
+        (tmp_path / "large.md").write_text("x" * 30_000, encoding="utf-8")
+
+        context = adapter._load_topic_context_file("large.md")
+
+        assert len(context) < 21_000
+        assert context.endswith("[Context file truncated]")
+
+    def test_symlink_loop_context_file_is_ignored(self, adapter, tmp_path):
+        adapter.config.extra["channel_context_dir"] = str(tmp_path)
+        (tmp_path / "loop.md").symlink_to("loop.md")
+
+        assert adapter._load_topic_context_file("loop.md") is None
+
+    def test_outside_symlink_context_file_is_ignored(self, adapter, tmp_path):
+        adapter.config.extra["channel_context_dir"] = str(tmp_path)
+        outside = tmp_path.parent / "secret.md"
+        outside.write_text("must not load", encoding="utf-8")
+        (tmp_path / "linked.md").symlink_to(outside)
+
+        assert adapter._load_topic_context_file("linked.md") is None
 
 
 # ---------------------------------------------------------------------------

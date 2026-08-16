@@ -2438,6 +2438,10 @@ class MessageEvent:
     # Discord channel_skill_bindings).  A single name or ordered list.
     auto_skill: Optional[str | list[str]] = None
 
+    # Durable channel context prepended to the first user turn of a new
+    # session, then retained through normal transcript history.
+    auto_context: Optional[str] = None
+
     # Per-channel ephemeral system prompt (e.g. Discord channel_prompts).
     # Applied at API call time and never persisted to transcript history.
     channel_prompt: Optional[str] = None

@@ -655,6 +655,17 @@ Set this to `true` when the bot follows busy threads (via thread auto-engagement
 Slack supports both patterns: `@mention` required to start a conversation by default, but you can opt specific channels out via `SLACK_FREE_RESPONSE_CHANNELS` (comma-separated channel IDs) or `slack.free_response_channels` in `config.yaml`. Once the bot has an active session in a thread, subsequent thread replies do not require a mention. In **1:1 DMs** the bot always responds without needing a mention.
 :::
 
+#### Topic-based channel context
+
+Set `platforms.slack.extra.channel_context_dir` to a local directory, then set a Slack channel's topic to the exact basename of a Markdown file in that directory, such as `curriculum.md`. Hermes reads only safe `.md` basenames from that directory and prepends the file to the first user turn of each new or reset session. Slack purpose is not used.
+
+```yaml
+platforms:
+  slack:
+    extra:
+      channel_context_dir: /home/user/channel-context
+```
+
 :::caution Group DMs (MPIMs) are shared surfaces, not 1:1 DMs
 A **1:1 direct message** is a private conversation with one person, so it is mention-exempt. A **group DM (MPIM / multi-person DM)** is a *shared surface* — multiple people can see and trigger the bot — so it obeys the same operator controls as a channel: `require_mention`, `strict_mention`, `free_response_channels`, and `allowed_channels` all apply, and the bot only adds `:eyes:`/`:white_check_mark:` reactions when it is actually `@mentioned`. To let the bot respond freely in a specific group DM, add its channel ID (starts with `G`) to `free_response_channels`.
 :::
