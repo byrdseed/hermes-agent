@@ -5621,6 +5621,13 @@ class TurnRunner:
 
 
 
+def _inject_auto_context_for_new_session(event: MessageEvent, is_new_session: bool) -> None:
+    """Prepend durable channel context only to a session's first user turn."""
+    auto_context = getattr(event, "auto_context", None)
+    if is_new_session and auto_context:
+        event.text = f"{auto_context}\n\n{event.text}"
+
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
@@ -14108,6 +14115,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reply_to_author_name=event.reply_to_author_name,
                 reply_to_is_own_message=event.reply_to_is_own_message,
                 auto_skill=event.auto_skill,
+                auto_context=event.auto_context,
                 channel_prompt=event.channel_prompt,
                 channel_context=event.channel_context,
                 internal=event.internal,
@@ -16385,6 +16393,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # was_auto_reset is already consumed in the cleanup block above
             # (single source of truth); only the reset reason needs clearing here.
             session_entry.auto_reset_reason = None
+
+        _inject_auto_context_for_new_session(event, _is_new_session)
 
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
         # Discord channel_skill_bindings).  Supports a single name or ordered list.
