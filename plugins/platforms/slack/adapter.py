@@ -1160,6 +1160,7 @@ class SlackAdapter(BasePlatformAdapter):
         self._channel_name_cache: Dict[Tuple[str, str], str] = {}
         self._channel_context_cache: Dict[Tuple[str, str], Optional[str]] = {}
         self._channel_info_cache_times: Dict[Tuple[str, str], float] = {}
+        self._channel_info_retry_after: Dict[Tuple[str, str], float] = {}
         self._channel_info_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
         self._CHANNEL_NAME_CACHE_MAX = 5000
         # (team_id, user_id) → Slack bot identity, same workspace scoping as
@@ -4571,6 +4572,14 @@ class SlackAdapter(BasePlatformAdapter):
             configured = 300.0
         return max(5.0, min(configured, 3600.0))
 
+    def _channel_info_retry_delay(self) -> float:
+        """Minimum delay before retrying failed Slack metadata refreshes."""
+        try:
+            configured = float(self.config.extra.get("channel_info_retry_seconds", 5))
+        except (TypeError, ValueError):
+            configured = 5.0
+        return max(1.0, min(configured, 60.0))
+
     async def _resolve_channel_name(
         self, channel_id: str, team_id: str = ""
     ) -> str:
@@ -4586,11 +4595,18 @@ class SlackAdapter(BasePlatformAdapter):
         team_id = str(team_id or self._channel_team.get(channel_id, ""))
         cache_key = (team_id, str(channel_id))
         cached = self._channel_name_cache.get(cache_key)
-        cache_age = time.monotonic() - self._channel_info_cache_times.get(cache_key, 0)
+        now = time.monotonic()
+        cache_age = now - self._channel_info_cache_times.get(cache_key, 0)
         if (
             cached is not None
             and cache_key in self._channel_context_cache
             and cache_age < self._channel_info_cache_ttl()
+        ):
+            return cached
+        if (
+            cached is not None
+            and cache_key in self._channel_context_cache
+            and now < self._channel_info_retry_after.get(cache_key, 0)
         ):
             return cached
         if not self._app:
@@ -4608,14 +4624,20 @@ class SlackAdapter(BasePlatformAdapter):
                     and cache_age < self._channel_info_cache_ttl()
                 ):
                     return cached
+                if (
+                    cached is not None
+                    and cache_key in self._channel_context_cache
+                    and time.monotonic()
+                    < self._channel_info_retry_after.get(cache_key, 0)
+                ):
+                    return cached
                 try:
                     resp = await self._get_client(
                         channel_id, team_id=team_id or None
                     ).conversations_info(channel=channel_id)
                     payload = _slack_response_payload(resp)
                     if not payload.get("ok"):
-                        name = channel_id
-                        channel_context = None
+                        raise RuntimeError("Slack conversations.info returned non-OK")
                     else:
                         ch = payload.get("channel") or {}
                         if ch.get("is_im"):
@@ -4643,11 +4665,31 @@ class SlackAdapter(BasePlatformAdapter):
                         channel_id,
                         e,
                     )
-                    name = channel_id
-                    channel_context = None
+                    self._channel_info_retry_after[cache_key] = (
+                        time.monotonic() + self._channel_info_retry_delay()
+                    )
+                    if cached is not None and cache_key in self._channel_context_cache:
+                        return cached
+                    self._channel_name_cache[cache_key] = channel_id
+                    self._channel_context_cache[cache_key] = None
+                    self._channel_info_cache_times[cache_key] = 0
+                    self._trim_oldest_dict_entries(
+                        self._channel_name_cache, self._CHANNEL_NAME_CACHE_MAX
+                    )
+                    self._trim_oldest_dict_entries(
+                        self._channel_context_cache, self._CHANNEL_NAME_CACHE_MAX
+                    )
+                    self._trim_oldest_dict_entries(
+                        self._channel_info_cache_times, self._CHANNEL_NAME_CACHE_MAX
+                    )
+                    self._trim_oldest_dict_entries(
+                        self._channel_info_retry_after, self._CHANNEL_NAME_CACHE_MAX
+                    )
+                    return channel_id
                 self._channel_name_cache[cache_key] = name
                 self._channel_context_cache[cache_key] = channel_context
                 self._channel_info_cache_times[cache_key] = time.monotonic()
+                self._channel_info_retry_after.pop(cache_key, None)
                 self._trim_oldest_dict_entries(
                     self._channel_name_cache, self._CHANNEL_NAME_CACHE_MAX
                 )
@@ -4656,6 +4698,9 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 self._trim_oldest_dict_entries(
                     self._channel_info_cache_times, self._CHANNEL_NAME_CACHE_MAX
+                )
+                self._trim_oldest_dict_entries(
+                    self._channel_info_retry_after, self._CHANNEL_NAME_CACHE_MAX
                 )
                 return name
         finally:
@@ -4682,12 +4727,20 @@ class SlackAdapter(BasePlatformAdapter):
         root_fd = -1
         fd = -1
         try:
-            root = _Path(root_value).expanduser().resolve()
-            root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-            root_fd = os.open(root, root_flags)
-            file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(
-                os, "O_NONBLOCK", 0
-            )
+            root = _Path(root_value).expanduser()
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            directory = getattr(os, "O_DIRECTORY", 0)
+            if not root.is_absolute() or not nofollow or not directory:
+                return None
+            root_flags = os.O_RDONLY | directory | nofollow
+            root_fd = os.open("/", root_flags)
+            for component in root.parts[1:]:
+                if component in {"", ".", ".."}:
+                    return None
+                next_fd = os.open(component, root_flags, dir_fd=root_fd)
+                os.close(root_fd)
+                root_fd = next_fd
+            file_flags = os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0)
             fd = os.open(filename, file_flags, dir_fd=root_fd)
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 return None
