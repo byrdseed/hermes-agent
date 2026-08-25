@@ -19363,8 +19363,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
-    async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
-        """Inner handler that runs under the _running_agents sentinel guard."""
+    async def _handle_message_with_agent(
+        self, event, source, _quick_key: str, run_generation: int
+    ):
+        """Run the claimed turn inside its routed profile's runtime scope."""
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                return await self._handle_message_with_agent_inner(
+                    event, source, _quick_key, run_generation
+                )
+        return await self._handle_message_with_agent_inner(
+            event, source, _quick_key, run_generation
+        )
+
+    async def _handle_message_with_agent_inner(
+        self, event, source, _quick_key: str, run_generation: int
+    ):
+        """Inner handler that runs under the active-session sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
@@ -20035,7 +20051,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key=session_key,
                             user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
                         )
-                        if _hyg_runtime.get("api_key"):
+                        # Runtime resolution is intentionally repeated here
+                        # after the threshold check. The earlier best-effort
+                        # resolution may have failed while this authoritative
+                        # one succeeds, so re-apply the Codex live-thread guard
+                        # before constructing the throwaway hygiene agent.
+                        if _hygiene_compaction_requires_live_agent(_hyg_runtime):
+                            logger.info(
+                                "Session hygiene: deferring compaction for "
+                                "session %s to the live Codex app-server thread",
+                                session_entry.session_id,
+                            )
+                        elif _hyg_runtime.get("api_key"):
                             # Pass the FULL transcript (tool results included).
                             # Filtering to user/assistant-only starved the
                             # compressor: tool results are usually the bulk of
