@@ -262,6 +262,58 @@ class TestAgentMessageInterimDispatch:
             {"role": "assistant", "content": "I'll check the config first."}
         )
 
+    def test_each_completed_message_matches_only_its_own_streamed_text(self):
+        """Prior commentary must not poison the next segment's stream match.
+
+        The app-server bridge spans the whole turn while AIAgent's streamed
+        text comparison is message-scoped.  Leaving the first segment in the
+        accumulator makes the second completion look unstreamed and sends an
+        exact duplicate (#duplicate-final regression).
+        """
+        observed: list[tuple[str, bool]] = []
+
+        class SegmentAgent:
+            show_commentary = True
+
+            def __init__(self):
+                self._current_streamed_assistant_text = ""
+
+            def _fire_stream_delta(self, text):
+                self._current_streamed_assistant_text += text
+
+            def _fire_reasoning_delta(self, _text):
+                pass
+
+            def _emit_interim_assistant_message(self, message):
+                text = message["content"]
+                observed.append(
+                    (text, self._current_streamed_assistant_text.strip() == text)
+                )
+
+        agent = SegmentAgent()
+        bridge = make_codex_app_server_event_bridge(agent)
+
+        bridge({
+            "method": "item/agentMessage/delta",
+            "params": {"itemId": "am-1", "delta": "First update."},
+        })
+        bridge(_item_completed({
+            "type": "agentMessage", "id": "am-1", "text": "First update.",
+        }))
+        bridge({
+            "method": "item/agentMessage/delta",
+            "params": {"itemId": "am-2", "delta": "Final answer."},
+        })
+        bridge(_item_completed({
+            "type": "agentMessage", "id": "am-2", "text": "Final answer.",
+        }))
+
+        assert observed == [
+            ("First update.", True),
+            ("Final answer.", True),
+        ]
+        assert agent._current_streamed_assistant_text == ""
+
 
 
     def test_show_commentary_off_suppresses_interim(self):
@@ -399,3 +451,87 @@ class TestBridgeWiredInRuntime:
         agent.tool_progress_callback.assert_called_once()
         assert agent.tool_progress_callback.call_args.args[0] == "tool.started"
         assert agent.tool_progress_callback.call_args.args[1] == "exec_command"
+
+    @pytest.mark.parametrize(
+        ("preview_text", "final_text", "expected"),
+        [
+            ("The final answer.", "The final answer.", True),
+            ("I'll inspect it now.", "The final answer.", False),
+        ],
+    )
+    def test_result_marks_only_exact_delivered_final_as_previewed(
+        self, monkeypatch, preview_text, final_text, expected
+    ):
+        """A completed app-server agentMessage may already be visible.
+
+        The runtime result must identify an exact final-text match so the
+        gateway suppresses its normal fallback send. Unrelated commentary
+        must not suppress a different final response.
+        """
+        from agent import codex_runtime
+
+        delivered: set[str] = set()
+
+        class FakeSession:
+            def __init__(self, **kwargs):
+                self.on_event = kwargs["on_event"]
+
+            def run_turn(self, user_input, **_):
+                from agent.transports.codex_app_server_session import TurnResult
+
+                self.on_event(_item_completed({
+                    "type": "agentMessage",
+                    "id": "preview-1",
+                    "text": preview_text,
+                }))
+                return TurnResult(
+                    final_text=final_text,
+                    projected_messages=[],
+                    tool_iterations=0,
+                    turn_id="t1",
+                    thread_id="th1",
+                )
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(
+            "agent.transports.codex_app_server_session.CodexAppServerSession",
+            FakeSession,
+        )
+
+        agent = SimpleNamespace(
+            session_cwd=None,
+            _codex_session=None,
+            tool_progress_callback=None,
+            _fire_stream_delta=None,
+            _fire_reasoning_delta=None,
+            _emit_interim_assistant_message=lambda message: delivered.add(
+                message["content"]
+            ),
+            _interim_text_was_delivered=lambda text: text in delivered,
+            _iters_since_skill=0,
+            _skill_nudge_interval=0,
+            valid_tool_names=set(),
+            _sync_external_memory_for_turn=lambda **_: None,
+            _spawn_background_review=lambda **_: None,
+            session_api_calls=0,
+            session_prompt_tokens=0,
+            session_completion_tokens=0,
+            session_reasoning_tokens=0,
+            session_cached_tokens=0,
+            session_total_tokens=0,
+            context_compressor=None,
+            event_callback=None,
+            _session_db=None,
+        )
+
+        result = codex_runtime.run_codex_app_server_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[],
+            effective_task_id="t",
+        )
+
+        assert result.get("response_previewed", False) is expected
