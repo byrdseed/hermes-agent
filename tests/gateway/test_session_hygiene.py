@@ -920,6 +920,103 @@ def _make_progress_runner(monkeypatch, tmp_path, agent_cls, cfg_text):
     return runner, adapter, event
 
 
+@pytest.mark.parametrize("fail_first_resolution", [False, True])
+@pytest.mark.asyncio
+async def test_session_hygiene_defers_codex_app_server_to_live_agent(
+    monkeypatch, tmp_path, fail_first_resolution
+):
+    class UnexpectedHygieneAgent:
+        def __init__(self, **_kwargs):
+            raise AssertionError(
+                "gateway hygiene must not construct a throwaway Codex agent"
+            )
+
+    runner, _adapter, event = _make_progress_runner(
+        monkeypatch,
+        tmp_path,
+        UnexpectedHygieneAgent,
+        "compression:\n"
+        "  enabled: true\n"
+        "  hygiene_hard_message_limit: 4\n",
+    )
+    resolved = (
+        "gpt-5.5",
+        {
+            "api_mode": "codex_app_server",
+            "api_key": "fake",
+            "provider": "openai-codex",
+        },
+    )
+    if fail_first_resolution:
+        resolver = MagicMock(
+            side_effect=[RuntimeError("transient resolution failure"), resolved]
+        )
+    else:
+        resolver = MagicMock(return_value=resolved)
+    runner._resolve_session_agent_runtime = resolver
+    runner._evict_cached_agent = MagicMock()
+
+    result = await runner._handle_message(event)
+
+    assert result == "ok"
+    assert resolver.call_count == (2 if fail_first_resolution else 1)
+    runner._evict_cached_agent.assert_not_called()
+    runner._run_agent.assert_awaited_once()
+    runner.session_store.rewrite_transcript.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_session_hygiene_uses_routed_profile_runtime_scope(
+    monkeypatch, tmp_path
+):
+    from hermes_constants import get_hermes_home
+
+    class UnexpectedHygieneAgent:
+        def __init__(self, **_kwargs):
+            raise AssertionError(
+                "gateway hygiene must not construct a throwaway Codex agent"
+            )
+
+    runner, _adapter, event = _make_progress_runner(
+        monkeypatch,
+        tmp_path,
+        UnexpectedHygieneAgent,
+        "compression:\n  enabled: true\n",
+    )
+    routed_home = tmp_path / "profiles" / "coder"
+    routed_home.mkdir(parents=True)
+    (routed_home / "config.yaml").write_text(
+        "compression:\n  enabled: true\n",
+        encoding="utf-8",
+    )
+    runner.config.multiplex_profiles = True
+    runner._resolve_profile_home_for_source = MagicMock(return_value=routed_home)
+    event.source.profile = "coder"
+
+    def resolve_routed_runtime(**_kwargs):
+        assert get_hermes_home() == routed_home
+        return (
+            "gpt-5.5",
+            {
+                "api_mode": "codex_app_server",
+                "api_key": "fake",
+                "provider": "openai-codex",
+            },
+        )
+
+    runner._resolve_session_agent_runtime = MagicMock(
+        side_effect=resolve_routed_runtime
+    )
+    runner._evict_cached_agent = MagicMock()
+
+    result = await runner._handle_message(event)
+
+    assert result == "ok"
+    runner._resolve_profile_home_for_source.assert_called_with(event.source)
+    runner._evict_cached_agent.assert_not_called()
+    runner._run_agent.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # Cooldown persistence across gateway restarts (#74136)
 # ---------------------------------------------------------------------------

@@ -92,9 +92,13 @@ class DummyAgent:
         self.events.append((name, payload))
 
 
-def test_codex_app_server_native_auto_mode_leaves_thread_compaction_to_codex():
+@pytest.mark.parametrize("auto_compaction", ["native", "off"])
+def test_codex_app_server_non_hermes_auto_modes_do_not_initiate_compaction(
+    auto_compaction,
+):
     agent = DummyAgent(
-        TurnResult(thread_id="thread-1", turn_id="compact-turn-1")
+        TurnResult(thread_id="thread-1", turn_id="compact-turn-1"),
+        auto_compaction=auto_compaction,
     )
     messages = [{"role": "user", "content": "hi"}]
 
@@ -111,6 +115,42 @@ def test_codex_app_server_native_auto_mode_leaves_thread_compaction_to_codex():
     assert agent._codex_session.calls == 0
     assert agent.context_compressor.compression_count == 0
     assert agent.events == []
+
+
+def test_codex_app_server_hermes_auto_mode_compacts_the_live_thread():
+    agent = DummyAgent(
+        TurnResult(thread_id="thread-1", turn_id="compact-turn-1"),
+        auto_compaction="hermes",
+    )
+    messages = [{"role": "user", "content": "hi"}]
+
+    returned, prompt = compress_context(
+        agent,
+        messages,
+        "system",
+        approx_tokens=100000,
+        task_id="test",
+    )
+
+    assert returned is messages
+    assert prompt == "cached prompt"
+    assert agent._codex_session.calls == 1
+    assert agent.context_compressor.compression_count == 1
+    assert agent.events == [
+        (
+            "session:compress",
+            {
+                "platform": "cli",
+                "session_id": "hermes-session-1",
+                "old_session_id": "",
+                "in_place": False,
+                "compression_count": 1,
+                "runtime": "codex_app_server",
+                "thread_id": "thread-1",
+                "turn_id": "compact-turn-1",
+            },
+        )
+    ]
 
 
 def test_codex_app_server_compaction_heartbeat_refreshes_activity_while_waiting():
