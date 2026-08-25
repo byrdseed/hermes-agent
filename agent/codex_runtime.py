@@ -585,6 +585,17 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             logger.debug(
                 "_emit_interim_assistant_message raised", exc_info=True,
             )
+        finally:
+            # App-server runs one long event stream for the whole turn.  The
+            # generic AIAgent stream tracker, however, is scoped to one
+            # completed assistant message.  Without resetting it here, the
+            # next message is compared against every earlier commentary
+            # segment plus itself, so `_interim_content_was_streamed()` says
+            # False and the completed text is sent again.  This is especially
+            # visible on the last agentMessage: Slack shows the streamed final
+            # followed immediately by an identical commentary bubble.
+            if hasattr(agent, "_current_streamed_assistant_text"):
+                agent._current_streamed_assistant_text = ""
 
     def on_event(note: dict) -> None:
         if not isinstance(note, dict):
@@ -859,6 +870,24 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 
+    # The app-server event bridge surfaces every completed agentMessage so
+    # commentary appears before the following tool call. The last such item is
+    # also Codex's final response, which means it may already be visible when
+    # run_turn() returns. Preserve that exact-text fact for the gateway's
+    # duplicate-reply suppression; unrelated commentary must never suppress a
+    # different final answer.
+    response_previewed = False
+    if turn.final_text:
+        delivered = getattr(agent, "_interim_text_was_delivered", None)
+        if callable(delivered):
+            try:
+                response_previewed = bool(delivered(turn.final_text))
+            except Exception:
+                logger.debug(
+                    "codex app-server final-preview check failed",
+                    exc_info=True,
+                )
+
     return {
         "final_response": turn.final_text,
         "messages": messages,
@@ -872,6 +901,7 @@ def run_codex_app_server_turn(
             else {}
         ),
         "error": turn.error,
+        "response_previewed": response_previewed,
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after
