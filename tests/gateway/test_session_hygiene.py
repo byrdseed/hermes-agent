@@ -214,6 +214,21 @@ class TestTokenEstimation:
         assert estimate_messages_tokens_rough(large) > estimate_messages_tokens_rough(small)
 
 
+@pytest.mark.parametrize(
+    ("runtime", "expected"),
+    [
+        ({"api_mode": "codex_app_server"}, True),
+        ({"api_mode": "CODEX_APP_SERVER"}, True),
+        ({"api_mode": "chat_completions"}, False),
+        ({}, False),
+    ],
+)
+def test_hygiene_compaction_requires_the_live_codex_agent(runtime, expected):
+    from gateway.run import _hygiene_compaction_requires_live_agent
+
+    assert _hygiene_compaction_requires_live_agent(runtime) is expected
+
+
 @pytest.mark.asyncio
 async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch, tmp_path):
     """Regression for #21301: the hygiene agent is built without a session_db,
@@ -985,8 +1000,6 @@ def _make_progress_runner(monkeypatch, tmp_path, agent_cls, cfg_text):
         message_id="1",
     )
     return runner, adapter, event
-
-
 
 
 # ---------------------------------------------------------------------------
