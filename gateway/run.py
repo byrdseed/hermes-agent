@@ -142,6 +142,14 @@ def _record_hygiene_cooldown(gateway, session_id: str, cooldown_seconds: float) 
         logger.debug("session hygiene cooldown persist failed: %s", exc)
 
 
+def _hygiene_compaction_requires_live_agent(runtime: dict) -> bool:
+    """Whether compaction must run on the cached agent that owns the runtime."""
+    return (
+        str(runtime.get("api_mode") or "").strip().lower()
+        == "codex_app_server"
+    )
+
+
 def _status_template_to_regex(template: str) -> str:
     """Compile a compression status template constant into a regex source.
 
@@ -16506,6 +16514,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _hyg_configured_provider = None
             _hyg_configured_base_url = None
             _hyg_data = {}
+            _hyg_runtime = {}
             try:
                 _hyg_data = _load_gateway_config()
                 if _hyg_data:
@@ -16631,6 +16640,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         pass
             except Exception:
                 pass
+
+            # Codex app-server compaction is bound to a live app-server thread.
+            # The gateway hygiene path deliberately constructs a throwaway agent,
+            # which has no ``_codex_session`` yet and therefore cannot compact that
+            # thread. Let the real cached agent handle ``native``/``hermes``/``off``
+            # semantics instead of running a guaranteed no-op here and reporting
+            # it as a missing SessionDB binding.
+            if (
+                _hyg_compression_enabled
+                and _hygiene_compaction_requires_live_agent(_hyg_runtime)
+            ):
+                logger.info(
+                    "Session hygiene: deferring compaction for session %s to "
+                    "the live Codex app-server thread",
+                    session_entry.session_id,
+                )
+                _hyg_compression_enabled = False
 
             if _hyg_compression_enabled:
                 _hyg_context_length = await get_model_context_length_async(
