@@ -3571,8 +3571,10 @@ def _compress_context_via_codex_app_server(
             existing_prompt = agent._build_system_prompt(system_message)
         return messages, existing_prompt
 
-    codex_session = getattr(agent, "_codex_session", None)
-    if codex_session is None:
+    from agent.codex_runtime import get_codex_runtime_binding
+
+    binding = get_codex_runtime_binding(agent)
+    if binding.client is None:
         logger.info(
             "codex app-server compaction skipped: no active codex thread "
             "(session=%s messages=%d tokens=~%s)",
@@ -3608,7 +3610,7 @@ def _compress_context_via_codex_app_server(
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     try:
         _activity_heartbeat = _CompressionActivityHeartbeat(agent).start()
-        result = codex_session.compact_thread()
+        result = binding.compact_thread()
     except BaseException:
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression failed")
@@ -3621,11 +3623,7 @@ def _compress_context_via_codex_app_server(
         _activity_heartbeat.stop("context compression completed")
 
     if getattr(result, "should_retire", False):
-        try:
-            codex_session.close()
-        except Exception:
-            pass
-        agent._codex_session = None
+        binding.retire(preserve_thread=True)
 
     if getattr(result, "interrupted", False) or getattr(result, "error", None):
         try:

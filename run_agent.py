@@ -425,6 +425,38 @@ class AIAgent:
     def base_url(self) -> str:
         return self._base_url
 
+    def _get_codex_runtime_binding(self):
+        """Return the single owner of Codex client/session/thread state."""
+        from agent.codex_runtime import get_codex_runtime_binding
+
+        return get_codex_runtime_binding(self)
+
+    # Compatibility properties for integrations that previously seeded the
+    # three loose attributes directly. Production code delegates to the binding.
+    @property
+    def _codex_session(self):
+        return self._get_codex_runtime_binding().client
+
+    @_codex_session.setter
+    def _codex_session(self, value) -> None:
+        self._get_codex_runtime_binding().client = value
+
+    @property
+    def _codex_session_owner_id(self):
+        return self._get_codex_runtime_binding().owner_session_id
+
+    @_codex_session_owner_id.setter
+    def _codex_session_owner_id(self, value) -> None:
+        self._get_codex_runtime_binding().owner_session_id = value
+
+    @property
+    def _codex_resume_thread_id(self):
+        return self._get_codex_runtime_binding().thread_id
+
+    @_codex_resume_thread_id.setter
+    def _codex_resume_thread_id(self, value) -> None:
+        self._get_codex_runtime_binding().thread_id = value
+
     @base_url.setter
     def base_url(self, value: str) -> None:
         self._base_url = value
@@ -3066,16 +3098,13 @@ class AIAgent:
         # Codex app-server owns its model/tool loop and watches a private
         # interrupt event rather than Hermes' per-thread flag.
         if getattr(self, "api_mode", None) == "codex_app_server":
-            _codex_session = getattr(self, "_codex_session", None)
-            _request_interrupt = getattr(_codex_session, "request_interrupt", None)
-            if callable(_request_interrupt):
-                try:
-                    _request_interrupt()
-                except Exception:
-                    logger.debug(
-                        "Failed to interrupt Codex app-server turn",
-                        exc_info=True,
-                    )
+            try:
+                self._get_codex_runtime_binding().request_interrupt()
+            except Exception:
+                logger.debug(
+                    "Failed to interrupt Codex app-server turn",
+                    exc_info=True,
+                )
 
         # A cron turn performs its API request on the conversation thread to
         # avoid the nested interrupt-worker deadlock.  Unlike the normal worker
@@ -3255,9 +3284,8 @@ class AIAgent:
         # Codex owns its internal reasoning/tool loop, so use its first-class
         # active-turn steering protocol rather than interrupting the subprocess.
         if getattr(self, "api_mode", None) == "codex_app_server":
-            _codex_session = getattr(self, "_codex_session", None)
-            _native_steer = getattr(_codex_session, "request_steer", None)
-            if callable(_native_steer):
+            binding = self._get_codex_runtime_binding()
+            if binding.client is not None:
                 _redirect_lock = getattr(self, "_pending_redirect_lock", None)
                 if _redirect_lock is not None:
                     with _redirect_lock:
@@ -3266,7 +3294,7 @@ class AIAgent:
                 elif self._interrupt_requested:
                     return False
                 try:
-                    return bool(_native_steer(cleaned))
+                    return binding.request_steer(cleaned)
                 except Exception:
                     logger.debug("Codex app-server turn/steer failed", exc_info=True)
                     return False
@@ -4115,14 +4143,7 @@ class AIAgent:
 
     def _close_codex_app_server_session(self) -> None:
         """Retire the subprocess while preserving its resumable thread id."""
-        codex_session = getattr(self, "_codex_session", None)
-        if codex_session is None:
-            return
-        try:
-            codex_session.close()
-        except Exception:
-            pass
-        self._codex_session = None
+        self._get_codex_runtime_binding().retire(preserve_thread=True)
 
     def release_clients(self) -> None:
         """Release LLM client resources WITHOUT tearing down session tool state.
