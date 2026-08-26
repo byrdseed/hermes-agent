@@ -2273,6 +2273,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     ProcessingOutcome,
+    ProcessingPhase,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
@@ -3631,7 +3632,7 @@ class TurnRunner:
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
         if event_type == "tool.started" and tool_name != "_thinking":
-            self._set_processing_reaction_sync("computer")
+            self._set_processing_phase_sync(ProcessingPhase.USING_TOOL)
         # Live status line (Slack's assistant status): stash the current
         # tool phrase on the adapter; the _keep_typing refresh renders it
         # within a couple of seconds. Handled before every other gate
@@ -4266,10 +4267,10 @@ class TurnRunner:
         except Exception as _ack_err:
             logger.debug("voice ack schedule failed: %s", _ack_err)
 
-    def _set_processing_reaction_sync(self, emoji: str) -> None:
-        """Schedule a Slack lifecycle-reaction mode change from the agent thread."""
+    def _set_processing_phase_sync(self, phase: ProcessingPhase) -> None:
+        """Schedule a platform lifecycle-phase change from the agent thread."""
         ctx = self._ctx
-        adapter = ctx._reaction_adapter
+        adapter = ctx._processing_phase_adapter
         if (
             adapter is None
             or not ctx.event_message_id
@@ -4277,26 +4278,26 @@ class TurnRunner:
             or not ctx._run_still_current()
         ):
             return
-        setter = getattr(adapter, "set_processing_reaction", None)
+        setter = getattr(adapter, "set_processing_phase", None)
         if not callable(setter):
             return
         safe_schedule_threadsafe(
             setter(
                 ctx.source.chat_id,
                 ctx.event_message_id,
-                emoji,
+                phase,
                 str(getattr(ctx.source, "scope_id", "") or ""),
             ),
             ctx._loop_for_step,
             logger=logger,
-            log_message=f"processing reaction ({emoji}) scheduling error",
+            log_message=f"processing phase ({phase.value}) scheduling error",
         )
 
     def _step_callback_sync(self, iteration: int, prev_tools: list) -> None:
         ctx = self._ctx
         if not ctx._run_still_current():
             return
-        self._set_processing_reaction_sync("brain")
+        self._set_processing_phase_sync(ProcessingPhase.THINKING)
         if ctx._hooks_ref is None:
             return
         # prev_tools may be list[str] or list[dict] with "name"/"result"
@@ -4828,12 +4829,16 @@ class TurnRunner:
         # who set thinking_progress:true but kept tool_progress:off got a
         # None callback — so _thinking scratch bubbles never relayed even
         # though the progress queue was created for them.
+        # Semantic processing phases are independent too: Slack's lifecycle
+        # reaction still needs tool.started events when every text/status
+        # progress surface is disabled.
         agent.tool_progress_callback = (
             ctx.progress_callback
             if (
                 ctx.needs_progress_queue
                 or ctx.log_mode_enabled
                 or ctx._live_status_adapter is not None
+                or ctx._processing_phase_adapter is not None
             )
             else None
         )
@@ -4844,7 +4849,7 @@ class TurnRunner:
         )
         agent.step_callback = (
             ctx._step_callback_sync
-            if ctx._reaction_adapter is not None or ctx._hooks_ref.loaded_hooks
+            if ctx._processing_phase_adapter is not None or ctx._hooks_ref.loaded_hooks
             else None
         )
         agent.stream_delta_callback = _stream_delta_cb
@@ -24400,11 +24405,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _live_status_adapter = None
         if _live_status_mode == "off":
             _live_status_adapter = None
-        _reaction_adapter = self._adapter_for_source(source)
-        if not callable(
-            getattr(_reaction_adapter, "set_processing_reaction", None)
+        _processing_phase_adapter = self._adapter_for_source(source)
+        _phase_setter = getattr(
+            type(_processing_phase_adapter), "set_processing_phase", None
+        ) if _processing_phase_adapter is not None else None
+        if (
+            not callable(_phase_setter)
+            or _phase_setter is BasePlatformAdapter.set_processing_phase
         ):
-            _reaction_adapter = None
+            _processing_phase_adapter = None
         # "log" mode: tool calls are written to ~/.hermes/logs/tool_calls.log
         # instead of the chat (#3459 / #3458). Gateway-only by design.
         log_mode_enabled = progress_mode == "log" and source.platform != Platform.WEBHOOK
@@ -24500,7 +24509,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _run_still_current=_run_still_current,
             _live_status_adapter=_live_status_adapter,
             _live_status_mode=_live_status_mode,
-            _reaction_adapter=_reaction_adapter,
+            _processing_phase_adapter=_processing_phase_adapter,
             _thinking_enabled=_thinking_enabled,
             progress_mode=progress_mode,
             progress_grouping=progress_grouping,

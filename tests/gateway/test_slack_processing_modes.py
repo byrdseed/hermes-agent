@@ -3,24 +3,25 @@ from types import SimpleNamespace
 
 import pytest
 
+from gateway.platforms.base import ProcessingPhase
 from gateway.run import TurnRunner
 from gateway.turn_context import TurnContext
 
 
-class RecordingReactionAdapter:
+class RecordingPhaseAdapter:
     def __init__(self):
-        self.reactions = []
+        self.phases = []
 
-    async def set_processing_reaction(
-        self, channel_id, message_id, emoji, team_id=""
+    async def set_processing_phase(
+        self, channel_id, message_id, phase, scope_id=""
     ):
-        self.reactions.append((channel_id, message_id, emoji, team_id))
+        self.phases.append((channel_id, message_id, phase, scope_id))
         return True
 
 
 @pytest.mark.asyncio
-async def test_turn_runner_updates_slack_reaction_for_thinking_and_tool_modes():
-    adapter = RecordingReactionAdapter()
+async def test_turn_runner_emits_semantic_thinking_and_tool_phases():
+    adapter = RecordingPhaseAdapter()
     source = SimpleNamespace(
         chat_id="C123",
         user_id="U123",
@@ -31,7 +32,7 @@ async def test_turn_runner_updates_slack_reaction_for_thinking_and_tool_modes():
         source=source,
         event_message_id="1000.1",
         _run_still_current=lambda: True,
-        _reaction_adapter=adapter,
+        _processing_phase_adapter=adapter,
         _loop_for_step=asyncio.get_running_loop(),
         _hooks_ref=None,
     )
@@ -42,7 +43,7 @@ async def test_turn_runner_updates_slack_reaction_for_thinking_and_tool_modes():
     turn_runner.progress_callback("tool.started", "terminal", None, {})
     await asyncio.sleep(0.01)
 
-    assert adapter.reactions == [
-        ("C123", "1000.1", "brain", "T123"),
-        ("C123", "1000.1", "computer", "T123"),
+    assert adapter.phases == [
+        ("C123", "1000.1", ProcessingPhase.THINKING, "T123"),
+        ("C123", "1000.1", ProcessingPhase.USING_TOOL, "T123"),
     ]

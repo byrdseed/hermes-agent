@@ -2050,6 +2050,14 @@ class ProcessingOutcome(Enum):
     CANCELLED = "cancelled"
 
 
+class ProcessingPhase(Enum):
+    """Semantic phase of an in-flight message turn."""
+
+    STARTING = "starting"
+    THINKING = "thinking"
+    USING_TOOL = "using_tool"
+
+
 @dataclass
 class MessageEvent:
     """
@@ -5036,6 +5044,16 @@ class BasePlatformAdapter(ABC):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Hook called when background processing begins."""
+
+    async def set_processing_phase(
+        self,
+        channel_id: str,
+        message_id: str,
+        phase: ProcessingPhase,
+        scope_id: str = "",
+    ) -> bool:
+        """Update an in-flight turn's semantic phase when supported."""
+        return False
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Hook called when background processing completes.
