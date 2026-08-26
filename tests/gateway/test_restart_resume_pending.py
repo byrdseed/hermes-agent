@@ -36,12 +36,15 @@ from gateway.config import GatewayConfig, HomeChannel, Platform
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.run import (
     _AGENT_PENDING_SENTINEL,
+    AgentTurnOutcome,
     _auto_continue_freshness_window,
     _coerce_gateway_timestamp,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
+    _normalize_empty_agent_response,
     _should_clear_resume_pending_after_turn,
     build_resume_recovery_note,
+    classify_agent_turn_outcome,
 )
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from tests.gateway.restart_test_helpers import (
@@ -53,6 +56,40 @@ from tests.gateway.restart_test_helpers import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("agent_result", "expected"),
+    [
+        ({"final_response": "done"}, AgentTurnOutcome.SUCCESS),
+        ({"completed": True}, AgentTurnOutcome.SUCCESS),
+        ({"completed": False}, AgentTurnOutcome.INCOMPLETE),
+        ({"failed": True}, AgentTurnOutcome.INCOMPLETE),
+        ({"partial": True}, AgentTurnOutcome.INCOMPLETE),
+        ({"error": "boom"}, AgentTurnOutcome.INCOMPLETE),
+        ({"error": ""}, AgentTurnOutcome.SUCCESS),
+        (
+            {"interrupted": True, "failed": True, "completed": False},
+            AgentTurnOutcome.INTERRUPTED,
+        ),
+        (None, AgentTurnOutcome.INCOMPLETE),
+    ],
+)
+def test_agent_turn_outcome_has_one_explicit_precedence(agent_result, expected):
+    assert classify_agent_turn_outcome(agent_result) is expected
+
+
+def test_interrupted_outcome_suppresses_conflicting_failure_notice():
+    result = {
+        "interrupted": True,
+        "failed": True,
+        "partial": True,
+        "completed": False,
+        "error": "shutdown",
+        "api_calls": 1,
+    }
+
+    assert _normalize_empty_agent_response(result, "") == ""
 
 
 def test_resume_pending_is_cleared_only_after_successful_turn():
@@ -1039,4 +1076,3 @@ async def test_startup_restore_gate_releases_when_resume_turn_outlives_timeout(
 
     never_finishes.set()
     await slow_task
-

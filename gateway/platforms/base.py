@@ -2130,6 +2130,14 @@ class MessageEvent:
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    # Explicit lifecycle truth supplied by the gateway's agent-turn
+    # classifier.  Appended after the established public fields to preserve
+    # positional construction compatibility. ``None`` leaves the adapter to
+    # infer success from delivery; FAILURE/CANCELLED preserve execution truth
+    # when a terminal notice was delivered or an interrupted turn stayed
+    # silent.
+    processing_outcome_override: Optional[ProcessingOutcome] = None
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -6406,13 +6414,17 @@ class BasePlatformAdapter(ABC):
                         self.name, len(_response_pre_extract), event.source.chat_id,
                     )
 
-            # Determine overall success for the processing hook
+            # Determine overall success for the processing hook.  Agent
+            # execution truth, when supplied, takes precedence over delivery
+            # success (a delivered failure notice is still a failed turn).
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
-            # A delivered terminal warning does not make the underlying agent
-            # turn successful. GatewayRunner stamps failed/partial/incomplete
-            # turns so lifecycle reactions report execution truthfully.
-            if getattr(event, "_gateway_agent_turn_failed", False):
-                processing_ok = False
+            processing_outcome = event.processing_outcome_override
+            if processing_outcome is None:
+                processing_outcome = (
+                    ProcessingOutcome.SUCCESS
+                    if processing_ok
+                    else ProcessingOutcome.FAILURE
+                )
             # Clean up the per-turn streaming-TTS flag (#60671).
             self._streaming_tts_completed_turns.discard(
                 self._streaming_tts_turn_key(
@@ -6425,7 +6437,7 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook(
                 "on_processing_complete",
                 event,
-                ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
+                processing_outcome,
             )
 
             # The active drain owns debounce state. If a queue-mode timer has

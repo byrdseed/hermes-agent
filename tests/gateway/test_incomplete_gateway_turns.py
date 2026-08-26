@@ -213,3 +213,50 @@ async def test_partial_codex_commentary_ends_with_failure_notice(monkeypatch, tm
         ("start", "m-1"),
         ("complete", "m-1", ProcessingOutcome.FAILURE),
     ]
+
+
+@pytest.mark.asyncio
+async def test_interrupted_turn_reports_cancelled_without_failure_notice(
+    monkeypatch, tmp_path
+):
+    """Interruption outranks incomplete flags and intentionally stays silent."""
+    adapter = CaptureSlackAdapter()
+    runner = _make_runner(adapter)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "api_calls": 1,
+            "interrupted": True,
+            # Lower layers can report these together during teardown.  The
+            # canonical classifier must preserve interruption semantics.
+            "partial": True,
+            "completed": False,
+            "error": "cancelled during shutdown",
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"}
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100,
+    )
+    monkeypatch.setenv("SLACK_HOME_CHANNEL", "C123")
+
+    adapter.set_message_handler(runner._handle_message)
+    adapter._keep_typing = lambda *_args, **_kwargs: asyncio.Event().wait()
+
+    event = _make_event()
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    assert adapter.sent == []
+    assert adapter.processing_hooks == [
+        ("start", "m-1"),
+        ("complete", "m-1", ProcessingOutcome.CANCELLED),
+    ]
