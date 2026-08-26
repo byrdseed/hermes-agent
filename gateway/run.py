@@ -4585,11 +4585,35 @@ class TurnRunner:
             except Exception:
                 pass
 
-        _xproc_evicted_agent = None
+        _replaced_cached_agent = None
+        _replacement_reason = ""
         if _cache_lock and _cache is not None:
             with _cache_lock:
                 cached = _cache.get(ctx.session_key)
-                if cached and cached[1] == _sig:
+                if cached and cached[1] != _sig:
+                    # A config-signature miss rebuilds the AIAgent. Pop the
+                    # old instance explicitly instead of overwriting the cache
+                    # entry below: Codex app-server threads are single-writer,
+                    # so leaving the old cached agent alive makes the fresh
+                    # agent's thread/resume fail with "already has an active
+                    # writer". The exclusive Codex writer is retired
+                    # synchronously after releasing the cache lock; the rest of
+                    # the soft cleanup remains asynchronous.
+                    logger.info(
+                        "Agent cache invalidated for session %s: "
+                        "configuration signature changed",
+                        ctx.session_key,
+                    )
+                    evicted = _cache.pop(ctx.session_key, None)
+                    _ev_agent = (
+                        evicted[0]
+                        if isinstance(evicted, tuple) and evicted
+                        else None
+                    )
+                    if _ev_agent and _ev_agent is not _AGENT_PENDING_SENTINEL:
+                        _replaced_cached_agent = _ev_agent
+                        _replacement_reason = "configuration signature changed"
+                elif cached:
                     # cached[2] is the message_count at cache time;
                     # stale when a second process appended rows.
                     # cached[3] (when present) is the session_id the
@@ -4650,7 +4674,8 @@ class TurnRunner:
                             # cross-process branch below (#52197): don't
                             # block the event loop / cache lock on
                             # memory-provider shutdown or socket teardown.
-                            _xproc_evicted_agent = _ev_agent
+                            _replaced_cached_agent = _ev_agent
+                            _replacement_reason = "stale ended-session binding"
                     elif (
                         not _session_id_mismatch
                         and _cached_mc is not None
@@ -4681,7 +4706,8 @@ class TurnRunner:
                             # session's terminal sandbox / browser / bg
                             # processes for the rebuilt agent to inherit —
                             # mirrors _evict_cached_agent / idle-sweep.
-                            _xproc_evicted_agent = _ev_agent
+                            _replaced_cached_agent = _ev_agent
+                            _replacement_reason = "cross-process transcript change"
                     else:
                         agent = cached[0]
                         # Refresh LRU order so the cap enforcement evicts
@@ -4710,25 +4736,16 @@ class TurnRunner:
                 agent, self._runner._refresh_fallback_model(),
             )
 
-        # Lock released — now schedule cleanup of any cross-process-evicted
-        # agent on a daemon thread so memory-provider shutdown / socket
-        # teardown never blocks the gateway event loop or the cache lock
-        # the session-expiry watcher needs (#52197).
-        if _xproc_evicted_agent is not None:
-            try:
-                threading.Thread(
-                    target=self._runner._release_evicted_agent_soft,
-                    args=(_xproc_evicted_agent,),
-                    daemon=True,
-                    name=f"agent-xproc-evict-{str(ctx.session_key)[:24]}",
-                ).start()
-            except Exception:
-                # Interpreter shutdown or thread-spawn failure — release
-                # inline as a best-effort fallback.
-                try:
-                    self._runner._release_evicted_agent_soft(_xproc_evicted_agent)
-                except Exception:
-                    pass
+        # Lock released — retire the old Codex app-server synchronously before
+        # constructing a replacement that will resume the same durable thread.
+        # The remaining client cleanup stays off-thread so memory-provider and
+        # socket teardown cannot block the cache lock / event loop (#52197).
+        if _replaced_cached_agent is not None:
+            self._runner._retire_replaced_cached_agent(
+                _replaced_cached_agent,
+                session_key=ctx.session_key,
+                reason=_replacement_reason,
+            )
 
         if agent is None:
             # Config changed or first message — create fresh agent
@@ -23431,6 +23448,69 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # persisted session JSON on the next turn, so dropping it here is safe.
         if hasattr(agent, "_session_messages"):
             agent._session_messages = []
+
+    def _retire_replaced_cached_agent(
+        self,
+        agent: Any,
+        *,
+        session_key: str = "",
+        reason: str = "cache replacement",
+    ) -> None:
+        """Release a replaced agent's exclusive Codex writer before rebuild.
+
+        ``CodexAppServerSession`` owns a single-writer persistence handle for
+        its durable thread. Cache invalidation rebuilds an ``AIAgent`` that
+        immediately resumes that same thread, so deferring *all* cleanup to a
+        daemon thread creates a race: the replacement can reach
+        ``thread/resume`` before the old app-server exits and Codex rejects it
+        with ``already has an active writer``.
+
+        Close only that narrow writer synchronously (this method is called
+        from the agent worker after the cache lock is released), then keep the
+        existing soft release asynchronous for sockets, child agents, and
+        other potentially slow resources.
+        """
+        if agent is None or agent is _AGENT_PENDING_SENTINEL:
+            return
+
+        try:
+            close_codex = getattr(
+                agent, "_close_codex_app_server_session", None
+            )
+            if callable(close_codex):
+                close_codex()
+            else:
+                # Compatibility for lightweight/older agent objects that do
+                # not expose AIAgent's dedicated helper.
+                codex_session = getattr(agent, "_codex_session", None)
+                if codex_session is not None:
+                    codex_session.close()
+                    try:
+                        agent._codex_session = None
+                    except Exception:
+                        pass
+        except Exception:
+            logger.warning(
+                "Failed to retire replaced Codex writer for session %s (%s)",
+                session_key or "?",
+                reason,
+                exc_info=True,
+            )
+
+        try:
+            threading.Thread(
+                target=self._release_evicted_agent_soft,
+                args=(agent,),
+                daemon=True,
+                name=f"agent-cache-replace-{str(session_key)[:24]}",
+            ).start()
+        except Exception:
+            # If thread creation fails during interpreter shutdown, finish the
+            # idempotent soft release inline as a best-effort fallback.
+            try:
+                self._release_evicted_agent_soft(agent)
+            except Exception:
+                pass
 
     def _enforce_agent_cache_cap(self) -> None:
         """Evict oldest cached agents when cache exceeds _AGENT_CACHE_MAX_SIZE.
