@@ -5413,6 +5413,15 @@ class GatewaySlashCommandsMixin:
         from datetime import datetime
         from hermes_cli.config import is_managed, format_managed_message
 
+        external_update_command = os.environ.get(
+            "HERMES_GATEWAY_UPDATE_COMMAND", ""
+        ).strip()
+        if external_update_command:
+            return (
+                "Hermes gateway updates are promoted through the dedicated "
+                f"runtime checkout. Run `{external_update_command}` from a terminal."
+            )
+
         # Block non-messaging platforms (API server, webhooks, ACP)
         platform = event.source.platform
         _allowed = self._UPDATE_ALLOWED_PLATFORMS
