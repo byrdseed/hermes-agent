@@ -4618,6 +4618,12 @@ class BasePlatformAdapter(ABC):
             Tuple of (list of expanded file paths, cleaned text with the
             raw path strings removed).
         """
+        # A Markdown link to a local artifact is an explicit delivery request,
+        # not ordinary prose. Extract it first so the visible text keeps the
+        # human label instead of being reduced to broken ``[label](<>)``
+        # markup when the raw path is removed below.
+        linked_paths, content = BasePlatformAdapter.extract_local_file_links(content)
+
         _LOCAL_MEDIA_EXTS = MEDIA_DELIVERY_EXTS
         ext_part = '|'.join(e.lstrip('.') for e in _LOCAL_MEDIA_EXTS)
 
@@ -4661,22 +4667,116 @@ class BasePlatformAdapter(ABC):
                 )
 
         # Deduplicate by expanded path, preserving discovery order
-        seen: set = set()
+        seen: set = set(linked_paths)
         unique: list = []
         for raw, expanded in found:
             if expanded not in seen:
                 seen.add(expanded)
                 unique.append((raw, expanded))
 
-        paths = [expanded for _, expanded in unique]
+        paths = [*linked_paths, *(expanded for _, expanded in unique)]
 
         cleaned = content
-        if unique:
-            for raw, _exp in unique:
+        if found:
+            for raw, _exp in found:
                 cleaned = cleaned.replace(raw, '')
             cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
         return paths, cleaned
+
+    @staticmethod
+    def extract_local_file_links(content: str) -> Tuple[List[str], str]:
+        """Extract explicit Markdown links whose targets are local artifacts.
+
+        ``[label](/absolute/report.pdf)`` and
+        ``[label](</absolute/report.pdf>)`` are deliberate file-sharing
+        syntax. Existing files with a deliverable extension are returned for
+        native upload. Every local target, including a missing or partially
+        streamed one, is removed from visible text and replaced by its human
+        label so messaging platforms never expose a host filesystem path.
+        Links inside protected code/example spans are left untouched.
+
+        Unlike :meth:`extract_local_files`, this method does not promote bare
+        path mentions. That distinction lets the post-stream delivery path
+        accept explicit local links without regressing the stale-path guard
+        from #20834.
+        """
+        if not content or "](" not in content:
+            return [], content
+
+        link_re = re.compile(
+            r"!?\[(?P<label>[^\]]+)\]"
+            r"\((?P<target>[^()]*(?:\([^()]*\)[^()]*)*)\)"
+        )
+        scan_content = BasePlatformAdapter._mask_protected_spans(content)
+        deliverable_exts = {ext.lower() for ext in MEDIA_DELIVERY_EXTS}
+        matches: list[tuple[int, int, str, Optional[str]]] = []
+
+        for match in link_re.finditer(scan_content):
+            target = match.group("target").strip()
+            if target.startswith("<") and target.endswith(">"):
+                target = target[1:-1].strip()
+            if not re.match(r"^(?:~/|/|[A-Za-z]:[/\\])", target):
+                continue
+            expanded: Optional[str] = None
+            try:
+                candidate = os.path.expanduser(target)
+            except (OSError, RuntimeError, ValueError):
+                candidate = ""
+            if (
+                candidate
+                and os.path.splitext(target)[1].lower() in deliverable_exts
+                and os.path.isfile(candidate)
+            ):
+                expanded = candidate
+            label = content[match.start("label"):match.end("label")]
+            if re.match(r"^(?:~/|/|[A-Za-z]:[/\\])", label.strip()):
+                label = os.path.basename(target.rstrip("/\\")) or "Attached file"
+            matches.append((match.start(), match.end(), label, expanded))
+
+        # During token streaming the closing ``>)`` may not have arrived yet.
+        # Hide a trailing in-progress local target immediately so host paths
+        # cannot flash in preview edits before the complete link is parsed.
+        partial_link_re = re.compile(
+            r"!?\[(?P<label>[^\]]+)\]"
+            r"\(\s*(?:<(?:~/|/|[A-Za-z]:[/\\])[^>\n]*>?"
+            r"|(?:~/|/|[A-Za-z]:[/\\])[^)\n]*)\Z"
+        )
+        partial = partial_link_re.search(scan_content)
+        if partial:
+            label = content[partial.start("label"):partial.end("label")]
+            matches.append(
+                (partial.start(), partial.end(), label, None)
+            )
+
+        if not matches:
+            return [], content
+
+        paths: list[str] = []
+        seen: set[str] = set()
+        cleaned = content
+        for start, end, label, _expanded in reversed(matches):
+            cleaned = cleaned[:start] + label + cleaned[end:]
+        for _start, _end, _label, expanded in matches:
+            if expanded is not None and expanded not in seen:
+                seen.add(expanded)
+                paths.append(expanded)
+
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return paths, cleaned
+
+    @staticmethod
+    def has_incomplete_local_file_link(content: str) -> bool:
+        """Return whether a streamed suffix is an unfinished local link."""
+        if not content or "](" not in content:
+            return False
+        scan_content = BasePlatformAdapter._mask_protected_spans(content)
+        return bool(re.search(
+            r"!?\[[^\]]+\]"
+            r"\(\s*(?:<(?:~/|/|[A-Za-z]:[/\\])[^>\n]*>?"
+            r"|(?:~/|/|[A-Za-z]:[/\\])[^)\n]*)\Z",
+            scan_content,
+        ))
 
     async def _keep_typing(
         self,
@@ -5913,10 +6013,26 @@ class BasePlatformAdapter(ABC):
                     # (helps small models that don't use MEDIA: syntax). Skip
                     # system/command notices so config paths stay visible text
                     # instead of becoming native uploads.
-                    local_files, text_content = self.extract_local_files(text_content)
-                    local_files = self.filter_local_delivery_paths(local_files)
+                    # Markdown targets are explicit attachment requests. Keep
+                    # them separate from opportunistic bare-path detection so
+                    # a user can deliberately resend the same linked artifact
+                    # on a later turn (#73771 semantics for explicit MEDIA).
+                    linked_files, text_content = self.extract_local_file_links(text_content)
+                    linked_files = self.filter_local_delivery_paths(linked_files)
+                    bare_files, text_content = self.extract_local_files(text_content)
+                    bare_files = self.filter_local_delivery_paths(bare_files)
+                    explicit_media_paths = {path for path, _is_voice in media_files}
+                    if explicit_media_paths:
+                        linked_files = [
+                            path for path in linked_files
+                            if path not in explicit_media_paths
+                        ]
+                        bare_files = [
+                            path for path in bare_files
+                            if path not in explicit_media_paths
+                        ]
                     if _history_media_paths:
-                        _suppressed = [p for p in local_files if p in _history_media_paths]
+                        _suppressed = [p for p in bare_files if p in _history_media_paths]
                         if _suppressed:
                             # Log the suppression (#73771) — silent drops here
                             # cost operators hours of log-diving.
@@ -5925,7 +6041,12 @@ class BasePlatformAdapter(ABC):
                                 "delivered in this session: %s",
                                 self.name, len(_suppressed), _suppressed,
                             )
-                        local_files = [p for p in local_files if p not in _history_media_paths]
+                        bare_files = [p for p in bare_files if p not in _history_media_paths]
+                    linked_set = set(linked_files)
+                    local_files = [
+                        *linked_files,
+                        *(path for path in bare_files if path not in linked_set),
+                    ]
                     if local_files:
                         logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
 
@@ -6287,6 +6408,11 @@ class BasePlatformAdapter(ABC):
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            # A delivered terminal warning does not make the underlying agent
+            # turn successful. GatewayRunner stamps failed/partial/incomplete
+            # turns so lifecycle reactions report execution truthfully.
+            if getattr(event, "_gateway_agent_turn_failed", False):
+                processing_ok = False
             # Clean up the per-turn streaming-TTS flag (#60671).
             self._streaming_tts_completed_turns.discard(
                 self._streaming_tts_turn_key(

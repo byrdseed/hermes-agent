@@ -1,10 +1,11 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from agent.account_usage import (
     AccountUsageSnapshot,
     AccountUsageWindow,
     fetch_account_usage,
     render_account_usage_lines,
+    render_codex_usage_brief_lines,
 )
 
 
@@ -95,6 +96,44 @@ def test_fetch_account_usage_codex(monkeypatch):
     assert "Credits balance: $12.50" in snapshot.details
 
 
+def test_fetch_account_usage_labels_single_seven_day_primary_window_as_weekly(monkeypatch):
+    monkeypatch.setattr(
+        "agent.account_usage.resolve_codex_runtime_credentials",
+        lambda refresh_if_expiring=True: {
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "access-token",
+        },
+    )
+    monkeypatch.setattr(
+        "agent.account_usage._read_codex_tokens",
+        lambda: {"tokens": {"account_id": "acct_123"}},
+    )
+    monkeypatch.setattr(
+        "agent.account_usage.httpx.Client",
+        lambda timeout=15.0: _Client(
+            {
+                "plan_type": "pro",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 3,
+                        "reset_at": 1_900_000_000,
+                        "limit_window_seconds": 604800,
+                    },
+                    "secondary_window": None,
+                },
+                "credits": {"has_credits": False},
+            }
+        ),
+    )
+
+    snapshot = fetch_account_usage("openai-codex")
+
+    assert snapshot is not None
+    assert [window.label for window in snapshot.windows] == ["Weekly"]
+    assert snapshot.windows[0].used_percent == 3.0
+
+
 def test_render_account_usage_lines_includes_reset_and_provider():
     snapshot = AccountUsageSnapshot(
         provider="openai-codex",
@@ -116,6 +155,72 @@ def test_render_account_usage_lines_includes_reset_and_provider():
     assert "openai-codex (Pro)" in lines[1]
     assert "Session: 75% remaining (25% used)" in lines[2]
     assert "Credits balance: $9.99" in lines[3]
+
+
+def test_render_codex_usage_brief_lines_shows_used_percent_and_reset_only():
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    snapshot = AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage_api",
+        fetched_at=now,
+        windows=(
+            AccountUsageWindow(
+                label="Session",
+                used_percent=20,
+                reset_at=datetime(2026, 8, 8, 16, 30, tzinfo=timezone.utc),
+            ),
+            AccountUsageWindow(
+                label="Weekly",
+                used_percent=3,
+                reset_at=datetime(2026, 8, 15, 15, 0, tzinfo=timezone.utc),
+            ),
+        ),
+        details=("Credits balance: $9.99",),
+    )
+
+    assert render_codex_usage_brief_lines(snapshot, now=now) == [
+        "Weekly usage: 3% used. Resets in 7d 3h.",
+        "5 hour usage: 20% used. Resets in 4h 30m.",
+    ]
+
+
+def test_render_codex_usage_brief_lines_preserves_window_specific_units():
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    snapshot = AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage_api",
+        fetched_at=now,
+        windows=(
+            AccountUsageWindow(
+                label="Weekly",
+                used_percent=10,
+                reset_at=now + timedelta(hours=23),
+            ),
+            AccountUsageWindow(
+                label="Session",
+                used_percent=25,
+                reset_at=now + timedelta(minutes=30),
+            ),
+        ),
+    )
+
+    assert render_codex_usage_brief_lines(snapshot, now=now) == [
+        "Weekly usage: 10% used. Resets in 0d 23h.",
+        "5 hour usage: 25% used. Resets in 0h 30m.",
+    ]
+
+
+def test_render_codex_usage_brief_lines_omits_window_without_reset():
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    snapshot = AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage_api",
+        fetched_at=now,
+        windows=(AccountUsageWindow(label="Weekly", used_percent=10),),
+    )
+
+    assert render_codex_usage_brief_lines(snapshot, now=now) == []
+
 
 
 def test_fetch_account_usage_openrouter_uses_limit_remaining_and_ignores_deprecated_rate_limit(monkeypatch):

@@ -3416,6 +3416,39 @@ def _normalize_empty_agent_response(
     return response
 
 
+def _agent_turn_ended_unsuccessfully(agent_result: dict) -> bool:
+    """Whether a non-user-cancelled turn failed to reach a real completion."""
+    if not isinstance(agent_result, dict) or agent_result.get("interrupted"):
+        return False
+    return bool(
+        agent_result.get("failed")
+        or agent_result.get("partial")
+        or agent_result.get("error")
+        or agent_result.get("completed") is False
+    )
+
+
+def _normalize_partial_agent_response(agent_result: dict, response: str) -> str:
+    """Replace a misleading partial final with an explicit terminal notice.
+
+    Codex app-server can stream commentary such as "I'm continuing" and then
+    time out after a tool result. That commentary is not a successful final
+    answer and, if left as the turn's terminal message, falsely implies the
+    agent is still working.
+    """
+    if not _agent_turn_ended_unsuccessfully(agent_result):
+        return response
+    if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
+        return response
+
+    error_detail = str(agent_result.get("error") or "processing incomplete").strip()
+    return (
+        "⚠️ This run stopped unexpectedly after partial output and is no "
+        "longer working. "
+        f"{error_detail[:200]}. Please retry the task."
+    )
+
+
 def _is_gateway_hidden_reasoning_incomplete_turn(agent_result: dict) -> bool:
     """Detect retry-exhausted turns with hidden reasoning but no visible answer.
 
@@ -3575,6 +3608,8 @@ class TurnRunner:
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
+        if event_type == "tool.started" and tool_name != "_thinking":
+            self._set_processing_reaction_sync("computer")
         # Live status line (Slack's assistant status): stash the current
         # tool phrase on the adapter; the _keep_typing refresh renders it
         # within a couple of seconds. Handled before every other gate
@@ -4209,9 +4244,38 @@ class TurnRunner:
         except Exception as _ack_err:
             logger.debug("voice ack schedule failed: %s", _ack_err)
 
+    def _set_processing_reaction_sync(self, emoji: str) -> None:
+        """Schedule a Slack lifecycle-reaction mode change from the agent thread."""
+        ctx = self._ctx
+        adapter = ctx._reaction_adapter
+        if (
+            adapter is None
+            or not ctx.event_message_id
+            or not ctx._loop_for_step
+            or not ctx._run_still_current()
+        ):
+            return
+        setter = getattr(adapter, "set_processing_reaction", None)
+        if not callable(setter):
+            return
+        safe_schedule_threadsafe(
+            setter(
+                ctx.source.chat_id,
+                ctx.event_message_id,
+                emoji,
+                str(getattr(ctx.source, "scope_id", "") or ""),
+            ),
+            ctx._loop_for_step,
+            logger=logger,
+            log_message=f"processing reaction ({emoji}) scheduling error",
+        )
+
     def _step_callback_sync(self, iteration: int, prev_tools: list) -> None:
         ctx = self._ctx
         if not ctx._run_still_current():
+            return
+        self._set_processing_reaction_sync("brain")
+        if ctx._hooks_ref is None:
             return
         # prev_tools may be list[str] or list[dict] with "name"/"result"
         # keys.  Normalise to keep "tool_names" backward-compatible for
@@ -4739,7 +4803,11 @@ class TurnRunner:
         agent.tool_start_callback = (
             ctx.voice_ack_callback if ctx._voice_ack_guild[0] is not None else None
         )
-        agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
+        agent.step_callback = (
+            ctx._step_callback_sync
+            if ctx._reaction_adapter is not None or ctx._hooks_ref.loaded_hooks
+            else None
+        )
         agent.stream_delta_callback = _stream_delta_cb
         agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
         agent.status_callback = ctx._status_callback_sync
@@ -5211,6 +5279,7 @@ class TurnRunner:
             ctx.message = (
                 "[System note: A new message has arrived. The conversation "
                 "history contains pending tool outputs from an interrupted turn. "
+                "The prior run ended and is NOT still working. "
                 "IGNORE those pending results. Address the user's NEW message "
                 "below FIRST. Do NOT re-execute old tool calls from the history.]\n\n"
                 + ctx.message
@@ -17488,8 +17557,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # verbatim into the channel — where peer agents can ingest it as a
             # completed assistant turn (#51628). Blank it here so the normal
             # empty-response handling (and the suppression below) applies.
+            if _agent_turn_ended_unsuccessfully(agent_result):
+                # Lifecycle hooks must reflect agent execution, not merely
+                # whether a terminal warning reached the platform. Without
+                # the sidecar Slack shows a green check for a timed-out turn.
+                setattr(event, "_gateway_agent_turn_failed", True)
             if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
                 response = ""
+            elif _agent_turn_ended_unsuccessfully(agent_result):
+                response = _normalize_partial_agent_response(agent_result, response)
             try:
                 from gateway.response_filters import is_intentional_silence_agent_result
                 _intentional_silence = is_intentional_silence_agent_result(
@@ -18030,7 +18106,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # content the user hasn't seen (streaming only sent earlier
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
-            if agent_result.get("already_sent") and not agent_result.get("failed"):
+            if (
+                agent_result.get("already_sent")
+                and not _agent_turn_ended_unsuccessfully(agent_result)
+            ):
                 if response:
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
@@ -19135,7 +19214,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event: MessageEvent,
         adapter,
     ) -> None:
-        """Extract explicit MEDIA: tags from a response and deliver them.
+        """Extract explicit attachment requests from a streamed response.
 
         Called after streaming has already sent the text to the user, so the
         text itself is already delivered — this only handles file attachments
@@ -19144,12 +19223,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Unlike the non-streaming path in ``gateway/platforms/base.py`` (which
         also auto-detects bare local paths via ``extract_local_files``), this
         post-stream rescan is EXPLICIT-ONLY. The visible reply has already
-        been streamed verbatim, so a bare path string here was either (a)
-        already shown to the user as text, or (b) stale tool/inspected
-        content that was never part of the intended visible reply. Promoting
-        such paths into uploads after the fact sent files the model never
-        asked to deliver (#20834). Only ``MEDIA:`` directives — the explicit
-        attachment contract — trigger post-stream uploads.
+        been streamed, so bare path mentions remain text (#20834). Explicit
+        ``MEDIA:`` directives and Markdown links whose target is an existing
+        local artifact both trigger upload; the latter is the file-link
+        contract used by Codex-facing clients.
         """
         from pathlib import Path
         from urllib.parse import quote as _quote
@@ -19165,6 +19242,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+            linked_files, cleaned = BasePlatformAdapter.extract_local_file_links(cleaned)
+            linked_files = BasePlatformAdapter.filter_local_delivery_paths(linked_files)
+            seen_media_paths = {path for path, _is_voice in media_files}
+            media_files.extend(
+                (path, False) for path in linked_files if path not in seen_media_paths
+            )
             # Do NOT deduplicate explicit MEDIA tags against prior turns here
             # (#73771). This rescan is already EXPLICIT-ONLY (see docstring):
             # a MEDIA: directive in the final streamed reply is the model
@@ -19174,10 +19257,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Mirrors the same filter removal on the non-streaming path in
             # gateway/platforms/base.py.
             # Strip image URLs from the cleaned text for parity with the
-            # non-streaming chain, but do NOT run extract_local_files here:
+            # non-streaming chain. Do NOT run extract_local_files here:
             # post-stream delivery is explicit-only (#20834). Bare local paths
-            # in an already-streamed reply are text the user has seen (or
-            # stale inspected content), not an attachment request.
+            # in an already-streamed reply are text the user has seen (or stale
+            # inspected content), not an attachment request. The link extractor
+            # above is deliberately narrower.
             adapter.extract_images(cleaned)
 
             _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
@@ -24213,6 +24297,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _live_status_adapter = None
         if _live_status_mode == "off":
             _live_status_adapter = None
+        _reaction_adapter = self._adapter_for_source(source)
+        if not callable(
+            getattr(_reaction_adapter, "set_processing_reaction", None)
+        ):
+            _reaction_adapter = None
         # "log" mode: tool calls are written to ~/.hermes/logs/tool_calls.log
         # instead of the chat (#3459 / #3458). Gateway-only by design.
         log_mode_enabled = progress_mode == "log" and source.platform != Platform.WEBHOOK
@@ -24308,6 +24397,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _run_still_current=_run_still_current,
             _live_status_adapter=_live_status_adapter,
             _live_status_mode=_live_status_mode,
+            _reaction_adapter=_reaction_adapter,
             _thinking_enabled=_thinking_enabled,
             progress_mode=progress_mode,
             progress_grouping=progress_grouping,
@@ -25609,7 +25699,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # final answer.  Suppressing delivery here leaves the user staring
         # at silence.  (#10xxx — "agent stops after web search")
         _sc = stream_consumer_holder[0]
-        if isinstance(response, dict) and not response.get("failed"):
+        if isinstance(response, dict) and not _agent_turn_ended_unsuccessfully(response):
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"
             # response_previewed means the interim_assistant_callback already

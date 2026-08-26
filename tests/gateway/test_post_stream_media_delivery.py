@@ -3,8 +3,8 @@
 ``GatewayRunner._deliver_media_from_response`` runs AFTER streaming has sent
 the visible reply. At that point a bare local filesystem path in the response
 text is either text the user already saw, or stale inspected/tool content —
-it is NOT an attachment request. Only explicit ``MEDIA:`` directives may
-trigger post-stream uploads.
+it is NOT an attachment request. Only explicit ``MEDIA:`` directives and
+Markdown artifact links may trigger post-stream uploads.
 
 The non-streaming path (``gateway/platforms/base.py``) keeps its bare-path
 auto-detect (``extract_local_files``) — that path controls what text is sent
@@ -51,6 +51,7 @@ def _adapter():
         extract_media=BasePlatformAdapter.extract_media,
         extract_images=BasePlatformAdapter.extract_images,
         extract_local_files=BasePlatformAdapter.extract_local_files,
+        extract_local_file_links=BasePlatformAdapter.extract_local_file_links,
         send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
         send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
         send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="image")),
@@ -110,4 +111,21 @@ async def test_explicit_media_tag_still_delivers_post_stream(tmp_path, monkeypat
     assert images_kwargs["chat_id"] == "C123CHAN"
     assert str(media_file) in images_kwargs["images"][0][0]
 
+
+@pytest.mark.asyncio
+async def test_explicit_markdown_file_link_delivers_post_stream(tmp_path, monkeypatch):
+    """A local Markdown target is deliberate sharing syntax, not a stale bare
+    path mention, so streamed replies upload it as a native document."""
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "report.pdf")
+    adapter = _adapter()
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({}),
+        f"[Open the report](<{media_file}>)",
+        _event(),
+        adapter,
+    )
+
+    adapter.send_document.assert_awaited_once()
+    assert adapter.send_document.await_args.kwargs["file_path"] == str(media_file)
 

@@ -160,6 +160,7 @@ def _simulate_note_injection(
         message = (
             "[System note: A new message has arrived. The conversation "
             "history contains pending tool outputs from an interrupted turn. "
+            "The prior run ended and is NOT still working. "
             "IGNORE those pending results. Address the user's NEW message "
             "below FIRST. Do NOT re-execute old tool calls from the history.]\n\n"
             + message
@@ -1038,5 +1039,4 @@ async def test_startup_restore_gate_releases_when_resume_turn_outlives_timeout(
 
     never_finishes.set()
     await slow_task
-
 

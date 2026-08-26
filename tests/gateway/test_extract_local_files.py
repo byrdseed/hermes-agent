@@ -81,6 +81,89 @@ class TestBasicDetection:
             assert len(paths) == 1, f"Failed for {ext}"
             assert paths[0] == f"/tmp/report{ext}"
 
+    def test_markdown_local_link_uploads_and_keeps_label(self):
+        path = "/tmp/report.pdf"
+        paths, cleaned = _extract(
+            f"[Open the report](<{path}>)",
+            existing_files={path},
+        )
+        assert paths == [path]
+        assert cleaned == "Open the report"
+
+    def test_plain_markdown_local_link_uploads_and_keeps_label(self):
+        path = "/tmp/report.pdf"
+        paths, cleaned = _extract(
+            f"Download [the report]({path}) now",
+            existing_files={path},
+        )
+        assert paths == [path]
+        assert cleaned == "Download the report now"
+
+    def test_markdown_local_link_in_code_is_not_uploaded(self):
+        path = "/tmp/report.pdf"
+        text = f"Use `[the report](<{path}>)` as an example"
+        paths, cleaned = _extract(text, existing_files={path})
+        assert paths == []
+        assert cleaned == text
+
+    def test_missing_markdown_local_link_hides_host_path(self):
+        path = "/home/user/missing.pdf"
+        paths, cleaned = _extract(
+            f"[Open the report](<{path}>)",
+            existing_files=set(),
+        )
+        assert paths == []
+        assert cleaned == "Open the report"
+
+    def test_partial_markdown_local_link_hides_host_path(self):
+        path = "/home/user/report.pdf"
+        paths, cleaned = _extract(
+            f"[Open the report](<{path}",
+            existing_files={path},
+        )
+        assert paths == []
+        assert cleaned == "Open the report"
+
+    def test_partial_angle_link_after_closing_bracket_hides_host_path(self):
+        path = "/home/user/report.pdf"
+        paths, cleaned = _extract(
+            f"[Open the report](<{path}>",
+            existing_files={path},
+        )
+        assert paths == []
+        assert cleaned == "Open the report"
+        assert BasePlatformAdapter.has_incomplete_local_file_link(
+            f"[Open the report](<{path}>"
+        )
+
+    def test_path_label_is_replaced_with_safe_basename(self):
+        path = "/home/user/report.pdf"
+        paths, cleaned = _extract(
+            f"[{path}](<{path}>)",
+            existing_files={path},
+        )
+        assert paths == [path]
+        assert cleaned == "report.pdf"
+
+    def test_markdown_image_link_uploads_and_keeps_alt_text(self):
+        path = "/tmp/chart.png"
+        paths, cleaned = _extract(
+            f"![Revenue chart](<{path}>)",
+            existing_files={path},
+        )
+        assert paths == [path]
+        assert cleaned == "Revenue chart"
+
+    def test_bare_and_linked_duplicate_path_is_removed_everywhere(self):
+        path = "/tmp/report.pdf"
+        paths, cleaned = _extract(
+            f"Report at {path}. [Open it](<{path}>)",
+            existing_files={path},
+        )
+        assert paths == [path]
+        assert path not in cleaned
+        assert cleaned == "Report at . Open it"
+
 
     def test_path_at_line_start(self):
         paths, _ = _extract("/var/data/image.png")

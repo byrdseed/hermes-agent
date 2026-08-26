@@ -151,5 +151,65 @@ async def test_incomplete_codex_turn_stays_out_of_slack_transcript(monkeypatch, 
     assert runner.session_store.append_to_transcript.call_args_list[1].args[1]["content"] == "hello"
     assert adapter.processing_hooks == [
         ("start", "m-1"),
-        ("complete", "m-1", ProcessingOutcome.SUCCESS),
+        ("complete", "m-1", ProcessingOutcome.FAILURE),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_partial_codex_commentary_ends_with_failure_notice(monkeypatch, tmp_path):
+    """A streamed progress claim must not masquerade as a completed turn."""
+    adapter = CaptureSlackAdapter()
+    runner = _make_runner(adapter)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "I'm continuing with the deployment cleanup.",
+            "messages": [
+                {"role": "user", "content": "keep going"},
+                {
+                    "role": "assistant",
+                    "content": "I'm continuing with the deployment cleanup.",
+                },
+                {
+                    "role": "tool",
+                    "content": "partial tool result",
+                    "tool_call_id": "call-1",
+                },
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "api_calls": 1,
+            "partial": True,
+            "completed": False,
+            "interrupted": False,
+            "error": "codex went silent after a tool result",
+            "response_previewed": True,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"}
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100,
+    )
+    monkeypatch.setenv("SLACK_HOME_CHANNEL", "C123")
+
+    adapter.set_message_handler(runner._handle_message)
+    adapter._keep_typing = lambda *_args, **_kwargs: asyncio.Event().wait()
+
+    event = _make_event()
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    assert len(adapter.sent) == 1
+    terminal = adapter.sent[0]["content"]
+    assert "stopped unexpectedly" in terminal
+    assert "no longer working" in terminal
+    assert "codex went silent after a tool result" in terminal
+    assert "I'm continuing" not in terminal
+    assert adapter.processing_hooks == [
+        ("start", "m-1"),
+        ("complete", "m-1", ProcessingOutcome.FAILURE),
     ]

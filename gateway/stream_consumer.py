@@ -868,6 +868,31 @@ class GatewayStreamConsumer:
                     )
                 ):
                     should_edit = False
+                if (
+                    should_edit
+                    and self._accumulated
+                    and _len_fn(self._accumulated) > _safe_limit
+                ):
+                    if (
+                        not got_done
+                        and _BasePlatformAdapter.has_incomplete_local_file_link(
+                            self._accumulated
+                        )
+                    ):
+                        # Never seal an overflow chunk through the middle of a
+                        # local link. Wait for the closing delimiter, then
+                        # sanitize the whole target before splitting. Otherwise
+                        # a raw path fragment can become an immutable second
+                        # chunk even though each chunk is cleaned separately.
+                        should_edit = False
+                    else:
+                        # The raw final response is retained by the agent for
+                        # post-stream attachment extraction. The consumer owns
+                        # only visible text, so it is safe to split the cleaned
+                        # form once no unresolved local-link suffix remains.
+                        self._accumulated = self._clean_for_display(
+                            self._accumulated
+                        )
                 if should_edit and self._accumulated:
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
@@ -1194,7 +1219,7 @@ class GatewayStreamConsumer:
 
     @staticmethod
     def _clean_for_display(text: str) -> str:
-        """Strip MEDIA: directives and internal markers from text before display.
+        """Strip attachment directives and local targets before display.
 
         The streaming path delivers raw text chunks that may include
         ``MEDIA:<path>`` tags and ``[[audio_as_voice]]`` directives meant for
@@ -1203,7 +1228,9 @@ class GatewayStreamConsumer:
         stream finishes — we just need to hide the raw directives from the
         user.
         """
-        return _BasePlatformAdapter.strip_media_directives_for_display(text)
+        cleaned = _BasePlatformAdapter.strip_media_directives_for_display(text)
+        _paths, cleaned = _BasePlatformAdapter.extract_local_file_links(cleaned)
+        return cleaned
 
     async def _send_new_chunk(
         self,

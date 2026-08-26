@@ -1003,6 +1003,11 @@ class SlackAdapter(BasePlatformAdapter):
         # Entries are normally removed when the reaction completes, but an
         # exception between add and finalize would leak them — keep it bounded.
         self._reacting_message_ids: set = set()
+        # Current lifecycle reaction per workspace-scoped message. This lets
+        # the gateway replace 👀 with a mode indicator and still remove the
+        # correct emoji at completion.
+        self._processing_reactions: Dict[Any, str] = {}
+        self._processing_reaction_lock = asyncio.Lock()
         self._REACTING_MESSAGE_IDS_MAX = 5000
         # Track active Assistant statuses by (team_id, channel_id, thread_ts)
         # so cleanup cannot clear an overlapping Slack Connect workspace.
@@ -3748,6 +3753,32 @@ class SlackAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("SLACK_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
+    async def set_processing_reaction(
+        self,
+        channel_id: str,
+        message_id: str,
+        emoji: str,
+        team_id: str = "",
+    ) -> bool:
+        """Replace the active lifecycle reaction with ``emoji``."""
+        async with self._processing_reaction_lock:
+            if not self._reactions_enabled() or not channel_id or not message_id:
+                return False
+            marker = self._workspace_message_marker(team_id, message_id)
+            if marker not in self._reacting_message_ids:
+                return False
+            current = self._processing_reactions.get(marker)
+            if current == emoji:
+                return True
+            if current:
+                await self._remove_reaction(channel_id, message_id, current, team_id)
+            added = await self._add_reaction(channel_id, message_id, emoji, team_id)
+            if added:
+                self._processing_reactions[marker] = emoji
+            elif current:
+                self._processing_reactions.pop(marker, None)
+            return added
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
         if not self._reactions_enabled():
@@ -3759,7 +3790,7 @@ class SlackAdapter(BasePlatformAdapter):
             return
         channel_id = getattr(event.source, "chat_id", None)
         if channel_id:
-            await self._add_reaction(channel_id, ts, "eyes", team_id)
+            await self.set_processing_reaction(channel_id, ts, "eyes", team_id)
 
     async def on_processing_complete(
         self, event: MessageEvent, outcome: ProcessingOutcome
@@ -3772,15 +3803,19 @@ class SlackAdapter(BasePlatformAdapter):
         marker = self._workspace_message_marker(team_id, ts) if ts else None
         if not ts or marker not in self._reacting_message_ids:
             return
-        self._reacting_message_ids.discard(marker)
         channel_id = getattr(event.source, "chat_id", None)
         if not channel_id:
+            self._processing_reactions.pop(marker, None)
+            self._reacting_message_ids.discard(marker)
             return
-        await self._remove_reaction(channel_id, ts, "eyes", team_id)
-        if outcome == ProcessingOutcome.SUCCESS:
-            await self._add_reaction(channel_id, ts, "white_check_mark", team_id)
-        elif outcome == ProcessingOutcome.FAILURE:
-            await self._add_reaction(channel_id, ts, "x", team_id)
+        async with self._processing_reaction_lock:
+            current = self._processing_reactions.pop(marker, "eyes")
+            await self._remove_reaction(channel_id, ts, current, team_id)
+            if outcome == ProcessingOutcome.SUCCESS:
+                await self._add_reaction(channel_id, ts, "white_check_mark", team_id)
+            elif outcome == ProcessingOutcome.FAILURE:
+                await self._add_reaction(channel_id, ts, "x", team_id)
+            self._reacting_message_ids.discard(marker)
 
     # ----- User identity resolution -----
 

@@ -2656,6 +2656,105 @@ class TestReactions:
         assert "1234567890.000001" not in adapter._reacting_message_ids
 
     @pytest.mark.asyncio
+    async def test_processing_reaction_tracks_thinking_and_tool_modes(self, adapter):
+        """The lifecycle reaction should show the agent's current work mode."""
+        adapter._app.client.reactions_add = AsyncMock()
+        adapter._app.client.reactions_remove = AsyncMock()
+        adapter._reacting_message_ids.add("1234567890.000003")
+
+        from gateway.platforms.base import (
+            MessageEvent,
+            MessageType,
+            ProcessingOutcome,
+            SessionSource,
+        )
+        from gateway.config import Platform
+
+        msg_event = MessageEvent(
+            text="build it",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="dm",
+                user_id="U_USER",
+            ),
+            message_id="1234567890.000003",
+        )
+
+        await adapter.on_processing_start(msg_event)
+        await adapter.set_processing_reaction(
+            "C123", "1234567890.000003", "brain"
+        )
+        await adapter.set_processing_reaction(
+            "C123", "1234567890.000003", "computer"
+        )
+        await adapter.on_processing_complete(msg_event, ProcessingOutcome.SUCCESS)
+
+        assert [
+            call.kwargs["name"]
+            for call in adapter._app.client.reactions_add.call_args_list
+        ] == ["eyes", "brain", "computer", "white_check_mark"]
+        assert [
+            call.kwargs["name"]
+            for call in adapter._app.client.reactions_remove.call_args_list
+        ] == ["eyes", "brain", "computer"]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_mode_updates_cannot_outlive_completion(self, adapter):
+        """Queued mode swaps must finish before the terminal reaction lands."""
+        import asyncio
+
+        active = set()
+
+        async def add_reaction(channel, timestamp, emoji, team_id=""):
+            await asyncio.sleep(0.001)
+            active.add(emoji)
+            return True
+
+        async def remove_reaction(channel, timestamp, emoji, team_id=""):
+            await asyncio.sleep(0.001)
+            active.discard(emoji)
+            return True
+
+        adapter._add_reaction = add_reaction
+        adapter._remove_reaction = remove_reaction
+        adapter._reacting_message_ids.add("1234567890.000004")
+
+        from gateway.platforms.base import (
+            MessageEvent,
+            MessageType,
+            ProcessingOutcome,
+            SessionSource,
+        )
+        from gateway.config import Platform
+
+        msg_event = MessageEvent(
+            text="build it",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="dm",
+                user_id="U_USER",
+            ),
+            message_id="1234567890.000004",
+        )
+        await adapter.on_processing_start(msg_event)
+
+        await asyncio.gather(
+            adapter.set_processing_reaction(
+                "C123", "1234567890.000004", "brain"
+            ),
+            adapter.set_processing_reaction(
+                "C123", "1234567890.000004", "computer"
+            ),
+            adapter.on_processing_complete(msg_event, ProcessingOutcome.SUCCESS),
+        )
+
+        assert active == {"white_check_mark"}
+
+    @pytest.mark.asyncio
     async def test_free_response_channel_message_is_registered_for_reactions(
         self, adapter
     ):

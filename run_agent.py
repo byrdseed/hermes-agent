@@ -4113,6 +4113,17 @@ class AIAgent:
         except Exception:
             pass
 
+    def _close_codex_app_server_session(self) -> None:
+        """Retire the subprocess while preserving its resumable thread id."""
+        codex_session = getattr(self, "_codex_session", None)
+        if codex_session is None:
+            return
+        try:
+            codex_session.close()
+        except Exception:
+            pass
+        self._codex_session = None
+
     def release_clients(self) -> None:
         """Release LLM client resources WITHOUT tearing down session tool state.
 
@@ -4129,6 +4140,8 @@ class AIAgent:
         We DO close:
           - OpenAI/httpx client pool (big chunk of held memory + sockets;
             the rebuilt agent gets a fresh client anyway)
+          - Codex app-server subprocess (the rebuilt agent resumes its durable
+            thread instead of keeping an orphan worker alive)
           - Active child subagents (per-turn artefacts; safe to drop)
 
         Safe to call multiple times.  Distinct from close() — which is the
@@ -4151,6 +4164,8 @@ class AIAgent:
                         pass
         except Exception:
             pass
+
+        self._close_codex_app_server_session()
 
         # Retire the OpenAI/httpx client to release sockets immediately.
         # #70773: eviction runs on the gateway's memory-manager thread — a
@@ -4232,6 +4247,10 @@ class AIAgent:
                     pass
         except Exception:
             pass
+
+        # 5b. Close the Codex app-server subprocess. The thread id is persisted
+        # independently, so a later agent can resume without leaking workers.
+        self._close_codex_app_server_session()
 
         # 6. Close the OpenAI/httpx client
         try:

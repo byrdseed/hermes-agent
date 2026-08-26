@@ -197,6 +197,7 @@ terminal(command="tmux new-session -d -s resumed 'hermes --resume 20260225_14305
 
 ## Hard Invariants (never violate, regardless of what you loaded)
 
+- **Verified learning gate** — do not save a correction to persistent memory or patch a skill until the claimed behavior is verified at its real user-visible or operational boundary. Configuration acceptance, API acceptance, and dry-runs are not execution proof. If verification is unavailable, keep the conclusion as a session hypothesis. If the user reports contradictory behavior, reopen the diagnosis before saving another lesson.
 - **Never break prompt caching** — don't change past context, toolsets, or the system prompt mid-conversation. The only exception is context compression.
 - **Message role alternation** — never two assistant or two user messages in a row; only `tool` results can repeat.
 - **Secrets in `.env`, settings in `config.yaml`** — never tell a user to put a non-credential setting in `.env`.

@@ -120,6 +120,41 @@ def render_account_usage_lines(snapshot: Optional[AccountUsageSnapshot], *, mark
     return lines
 
 
+def render_codex_usage_brief_lines(
+    snapshot: Optional[AccountUsageSnapshot],
+    *,
+    now: Optional[datetime] = None,
+) -> list[str]:
+    """Render the compact two-window Codex allowance view for messaging."""
+    if not snapshot or snapshot.provider != "openai-codex":
+        return []
+
+    current = now or _utc_now()
+    windows = {window.label.lower(): window for window in snapshot.windows}
+    lines: list[str] = []
+    for source_label, display_label in (
+        ("weekly", "Weekly usage"),
+        ("session", "5 hour usage"),
+    ):
+        window = windows.get(source_label)
+        if not window or window.used_percent is None or not window.reset_at:
+            continue
+        used = max(0, round(float(window.used_percent)))
+        line = f"{display_label}: {used}% used."
+        seconds = max(0, int((window.reset_at - current).total_seconds()))
+        if source_label == "weekly":
+            total_hours = seconds // 3600
+            days, hours = divmod(total_hours, 24)
+            reset = f"{days}d {hours}h"
+        else:
+            total_minutes = seconds // 60
+            hours, minutes = divmod(total_minutes, 60)
+            reset = f"{hours}h {minutes}m"
+        line += f" Resets in {reset}."
+        lines.append(line)
+    return lines
+
+
 def _fmt_usd(d: float) -> str:
     return f"${d:,.2f}"
 
@@ -525,11 +560,18 @@ def _fetch_codex_account_usage(
     payload = response.json() or {}
     rate_limit = payload.get("rate_limit") or {}
     windows: list[AccountUsageWindow] = []
-    for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
+    for key, fallback_label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
         window = rate_limit.get(key) or {}
         used = window.get("used_percent")
         if used is None:
             continue
+        duration = window.get("limit_window_seconds")
+        if isinstance(duration, (int, float)) and duration >= 6 * 24 * 3600:
+            label = "Weekly"
+        elif isinstance(duration, (int, float)) and duration <= 6 * 3600:
+            label = "Session"
+        else:
+            label = fallback_label
         windows.append(
             AccountUsageWindow(
                 label=label,

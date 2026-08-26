@@ -626,6 +626,47 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     return on_event
 
 
+def _persist_codex_thread_binding(
+    agent,
+    *,
+    session_id: str,
+    thread_id: str,
+) -> None:
+    """Bind one Hermes session to its Codex thread in memory and SQLite."""
+    session_id = str(session_id or "").strip()
+    thread_id = str(thread_id or "").strip()
+    if not session_id or not thread_id:
+        return
+
+    agent._codex_session_owner_id = session_id
+    agent._codex_resume_thread_id = thread_id
+    session_db = getattr(agent, "_session_db", None)
+    if session_db is None:
+        return
+    try:
+        ensure_session = getattr(agent, "_ensure_db_session", None)
+        if callable(ensure_session) and session_id == str(
+            getattr(agent, "session_id", "") or ""
+        ).strip():
+            ensure_session()
+        written = session_db.set_codex_thread_id(session_id, thread_id)
+        if written is False:
+            logger.warning(
+                "Codex app-server thread binding matched no session row "
+                "(session=%s thread=%s)",
+                session_id,
+                thread_id,
+            )
+    except Exception:
+        logger.warning(
+            "Codex app-server thread binding persist failed "
+            "(session=%s thread=%s)",
+            session_id,
+            thread_id,
+            exc_info=True,
+        )
+
+
 def run_codex_app_server_turn(
     agent,
     *,
@@ -646,6 +687,32 @@ def run_codex_app_server_turn(
         CodexAppServerSession,
         _ServerRequestRouting,
     )
+
+    _turn_session_id = str(getattr(agent, "session_id", "") or "").strip()
+    _codex_session = getattr(agent, "_codex_session", None)
+    _codex_owner_id = str(
+        getattr(agent, "_codex_session_owner_id", "") or ""
+    ).strip()
+
+    # CLI/TUI session commands reuse one AIAgent while changing session_id.
+    # A live Codex thread is append-only and must never cross that logical
+    # conversation boundary. Gateway agents are normally rebuilt instead, but
+    # this owner check makes the invariant explicit for every entrypoint.
+    if (
+        _codex_session is not None
+        and _codex_owner_id
+        and _turn_session_id
+        and _codex_owner_id != _turn_session_id
+    ):
+        try:
+            _codex_session.close()
+        except Exception:
+            pass
+        agent._codex_session = None
+        agent._codex_resume_thread_id = None
+        _codex_session = None
+    elif _codex_session is not None and not _codex_owner_id:
+        agent._codex_session_owner_id = _turn_session_id
 
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
@@ -691,6 +758,26 @@ def run_codex_app_server_turn(
         # users see no live tool-progress or interim commentary while
         # codex_app_server is running — only the final answer (#33200).
         # Supersedes the narrower item/started-only bridge from #38835.
+        _resume_owner_id = str(
+            getattr(agent, "_codex_session_owner_id", "") or ""
+        ).strip()
+        _resume_thread_id = None
+        if not _resume_owner_id or _resume_owner_id == _turn_session_id:
+            _resume_thread_id = str(
+                getattr(agent, "_codex_resume_thread_id", "") or ""
+            ).strip() or None
+        if _resume_thread_id is None and agent._session_db and agent.session_id:
+            try:
+                _resume_thread_id = agent._session_db.get_codex_thread_id(
+                    agent.session_id
+                )
+            except Exception:
+                logger.warning(
+                    "Codex app-server thread binding read failed (session=%s)",
+                    agent.session_id,
+                    exc_info=True,
+                )
+
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
             approval_callback=approval_callback,
@@ -699,7 +786,9 @@ def run_codex_app_server_turn(
                 auto_approve_apply_patch=auto_approve_requests,
             ),
             on_event=make_codex_app_server_event_bridge(agent),
+            resume_thread_id=_resume_thread_id,
         )
+        agent._codex_session_owner_id = _turn_session_id
 
     # NOTE: the user message is ALREADY appended to messages by the
     # standard run_conversation() flow (line ~11823) before the early
@@ -709,6 +798,15 @@ def run_codex_app_server_turn(
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
+        _known_thread_id = str(
+            getattr(agent._codex_session, "thread_id", "") or ""
+        ).strip()
+        if _known_thread_id:
+            _persist_codex_thread_binding(
+                agent,
+                session_id=_turn_session_id,
+                thread_id=_known_thread_id,
+            )
         # Crash → unconditionally drop the session so the next turn
         # respawns from scratch instead of reusing a dead client.
         try:
@@ -755,6 +853,16 @@ def run_codex_app_server_turn(
     )
     if _user_interrupted:
         agent.clear_interrupt()
+
+    # Persist the Codex thread identity before any retirement closes the
+    # subprocess. A replacement client can then use thread/resume and retain
+    # the exact prior task context instead of starting an empty thread.
+    if turn.thread_id:
+        _persist_codex_thread_binding(
+            agent,
+            session_id=_turn_session_id,
+            thread_id=turn.thread_id,
+        )
 
     # If the turn signalled the underlying client is wedged (deadline
     # blown, post-tool watchdog tripped, OAuth refresh died, subprocess

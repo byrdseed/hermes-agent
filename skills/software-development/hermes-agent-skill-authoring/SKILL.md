@@ -69,6 +69,8 @@ metadata:
 
 ## Writing Quality Principles
 
+**Verified learning gate:** when adding a lesson learned from an incident, first verify the generalized behavior at the real user-visible or operational boundary. A config write, API acceptance, dry-run, or nearby unit test is insufficient unless it exercises that behavior. If verification is unavailable or the user reports contradictory behavior, keep the conclusion in session context and do not encode it in the skill.
+
 A skill exists to make the agent's process more predictable. Predictability does **not** mean identical output every run; it means the agent reliably follows the same useful discipline.
 
 Use these quality checks when writing or editing any skill:

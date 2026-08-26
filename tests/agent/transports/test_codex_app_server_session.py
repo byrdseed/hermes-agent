@@ -53,6 +53,8 @@ class FakeClient:
         if method == "thread/start":
             return {"thread": {"id": "thread-fake-001"},
                     "activePermissionProfile": {"id": "workspace-write"}}
+        if method == "thread/resume":
+            return {"thread": {"id": (params or {}).get("threadId")}}
         if method == "turn/start":
             return {"turn": {"id": "turn-fake-001"}}
         if method == "turn/interrupt":
@@ -173,6 +175,48 @@ class TestLifecycle:
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
+
+    def test_existing_thread_is_resumed_after_client_replacement(self):
+        client = FakeClient()
+        s = make_session(client, resume_thread_id="thread-existing-123")
+
+        assert s.ensure_started() == "thread-existing-123"
+        assert ("thread/start", {"cwd": "/tmp"}) not in client.requests
+        assert (
+            "thread/resume",
+            {
+                "threadId": "thread-existing-123",
+                "cwd": "/tmp",
+            },
+        ) in client.requests
+
+    def test_failed_resume_never_falls_back_to_empty_thread(self):
+        client = FakeClient()
+
+        def reject_resume(method, params):
+            if method == "thread/resume":
+                from agent.transports.codex_app_server import CodexAppServerError
+
+                raise CodexAppServerError(
+                    code=-32603,
+                    message="saved thread temporarily unavailable",
+                )
+            if method == "thread/start":
+                pytest.fail("failed resume must not silently start a new thread")
+            return {}
+
+        client._request_handler = reject_resume
+        s = make_session(client, resume_thread_id="thread-existing-123")
+
+        result = s.run_turn("continue the task", turn_timeout=2.0)
+
+        assert result.should_retire is True
+        assert result.error is not None
+        assert "saved Codex thread could not be resumed" in result.error
+        assert "context was not discarded" in result.error
+        assert "/new" in result.error
+        assert [method for method, _ in client.requests] == ["thread/resume"]
+        assert s.thread_id == "thread-existing-123"
 
     def test_close_idempotent(self):
         client = FakeClient()
@@ -895,4 +939,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

@@ -78,6 +78,40 @@ def db(tmp_path):
     session_db.close()
 
 
+def test_codex_thread_binding_round_trip(db):
+    """A replacement app-server process can recover its durable thread id."""
+    db.create_session("codex-session", source="slack")
+
+    assert db.get_codex_thread_id("codex-session") is None
+    assert db.set_codex_thread_id("codex-session", "thread-123") is True
+    assert db.get_codex_thread_id("codex-session") == "thread-123"
+    assert db.clear_codex_thread_id("codex-session") is True
+    assert db.get_codex_thread_id("codex-session") is None
+    assert db.set_codex_thread_id("missing", "thread-456") is False
+
+
+def test_transcript_mutation_invalidates_codex_thread_binding(db):
+    """Codex cannot retain turns Hermes has replaced or rewound."""
+    db.create_session("codex-mutation", source="slack")
+    first_user_id = db.append_message("codex-mutation", "user", "first")
+    db.append_message("codex-mutation", "assistant", "answer")
+
+    db.set_codex_thread_id("codex-mutation", "thread-before-replace")
+    db.replace_messages(
+        "codex-mutation",
+        [{"role": "user", "content": "replacement"}],
+    )
+    assert db.get_codex_thread_id("codex-mutation") is None
+
+    replacement_id = db.list_recent_user_messages("codex-mutation", limit=1)[0][
+        "id"
+    ]
+    assert replacement_id != first_user_id
+    db.set_codex_thread_id("codex-mutation", "thread-before-rewind")
+    db.rewind_to_message("codex-mutation", replacement_id)
+    assert db.get_codex_thread_id("codex-mutation") is None
+
+
 # =========================================================================
 # Connection lifecycle
 # =========================================================================

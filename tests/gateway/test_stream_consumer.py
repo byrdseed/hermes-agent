@@ -2,7 +2,7 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -71,6 +71,40 @@ class TestCleanForDisplay:
         result = GatewayStreamConsumer._clean_for_display(text)
         assert "[[audio_as_voice]]" not in result
         assert "MEDIA:" not in result
+
+    def test_local_file_link_keeps_label_and_hides_host_path(self):
+        path = "/home/user/report.pdf"
+        with patch("os.path.isfile", return_value=True):
+            result = GatewayStreamConsumer._clean_for_display(
+                f"[Open the report](<{path}>)"
+            )
+        assert result == "Open the report"
+        assert path not in result
+
+    def test_partial_local_file_link_never_flashes_host_path(self):
+        path = "/home/user/report.pdf"
+        result = GatewayStreamConsumer._clean_for_display(
+            f"[Open the report](<{path}"
+        )
+        assert result == "Open the report"
+        assert path not in result
+
+    def test_partial_angle_link_with_closing_bracket_never_flashes_path(self):
+        path = "/home/user/report.pdf"
+        result = GatewayStreamConsumer._clean_for_display(
+            f"[Open the report](<{path}>"
+        )
+        assert result == "Open the report"
+        assert path not in result
+
+    def test_local_image_link_keeps_alt_text_and_hides_host_path(self):
+        path = "/home/user/chart.png"
+        with patch("os.path.isfile", return_value=True):
+            result = GatewayStreamConsumer._clean_for_display(
+                f"![Revenue chart](<{path}>)"
+            )
+        assert result == "Revenue chart"
+        assert path not in result
 
 
 # ── Integration: _send_or_edit strips MEDIA: ─────────────────────────────
@@ -266,6 +300,56 @@ class TestStreamRunMediaStripping:
             assert "MEDIA:" not in sent_text, f"MEDIA: leaked into display: {sent_text!r}"
 
         assert consumer.already_sent
+
+    @pytest.mark.asyncio
+    async def test_overflow_never_seals_local_path_fragment(self):
+        """A link crossing the platform split point is sanitized before the
+        consumer seals any overflow chunk."""
+        adapter = MagicMock()
+        sent_count = 0
+
+        async def send(**_kwargs):
+            nonlocal sent_count
+            sent_count += 1
+            return SimpleNamespace(success=True, message_id=f"msg_{sent_count}")
+
+        adapter.send = AsyncMock(side_effect=send)
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_edit")
+        )
+        adapter.MAX_MESSAGE_LENGTH = 180
+        adapter.truncate_message = lambda text, limit: [
+            text[start:start + limit]
+            for start in range(0, len(text), limit)
+        ]
+
+        path = "/home/user/very-secret-report.pdf"
+        response = "A" * 70 + f" [Open PDF](<{path}>) " + "tail " * 30
+        with patch("os.path.isfile", return_value=True):
+            consumer = GatewayStreamConsumer(
+                adapter,
+                "chat_123",
+                StreamConsumerConfig(
+                    edit_interval=0.01,
+                    buffer_threshold=5,
+                    cursor="",
+                ),
+            )
+            consumer.on_delta(response)
+            consumer.finish()
+            await consumer.run()
+
+        visible_payloads = [
+            call.kwargs.get("content", "")
+            for call in (
+                *adapter.send.call_args_list,
+                *adapter.edit_message.call_args_list,
+            )
+        ]
+        assert visible_payloads
+        assert all(path not in payload for payload in visible_payloads)
+        assert all("secret-report.pdf" not in payload for payload in visible_payloads)
+        assert any("Open PDF" in payload for payload in visible_payloads)
 
 
 class TestBeforeFinalizeHook:
@@ -1487,4 +1571,3 @@ class TestFlushPendingSync:
 
         consumer.finish()
         await task
-
