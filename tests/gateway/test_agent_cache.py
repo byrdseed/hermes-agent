@@ -1006,21 +1006,20 @@ class TestCrossProcessInvalidationDefersCleanup:
     @staticmethod
     def _evict_like_production(runner, session_key):
         """Run the post-#52197 cross-process eviction sequence verbatim:
-        pop the stale entry under the lock, then schedule the soft release
-        on a daemon thread AFTER the lock is released."""
-        _xproc_evicted_agent = None
+        pop the stale entry under the lock, retire its exclusive Codex writer,
+        then schedule the remaining soft release AFTER the lock is released."""
+        _replaced_cached_agent = None
         with runner._agent_cache_lock:
             evicted = runner._agent_cache.pop(session_key, None)
             _ev_agent = evicted[0] if isinstance(evicted, tuple) and evicted else None
             if _ev_agent is not None:
-                _xproc_evicted_agent = _ev_agent
-        if _xproc_evicted_agent is not None:
-            threading.Thread(
-                target=runner._release_evicted_agent_soft,
-                args=(_xproc_evicted_agent,),
-                daemon=True,
-                name="agent-xproc-evict-test",
-            ).start()
+                _replaced_cached_agent = _ev_agent
+        if _replaced_cached_agent is not None:
+            runner._retire_replaced_cached_agent(
+                _replaced_cached_agent,
+                session_key=session_key,
+                reason="test invalidation",
+            )
 
     def test_cleanup_runs_with_lock_released(self):
         """The cache lock must be acquirable WHILE the evicted agent's
@@ -1062,3 +1061,29 @@ class TestCrossProcessInvalidationDefersCleanup:
         assert "telegram:s1" not in runner._agent_cache
         runner._cleanup_agent_resources.assert_not_called()
 
+    def test_codex_writer_is_closed_before_async_soft_release(self):
+        """A replacement must not race thread/resume against the old writer."""
+        runner = self._runner()
+        events = []
+        soft_release_done = threading.Event()
+
+        old_agent = MagicMock()
+        old_agent._close_codex_app_server_session.side_effect = (
+            lambda: events.append("codex-writer-closed")
+        )
+
+        def _soft_release(agent):
+            events.append("soft-release")
+            soft_release_done.set()
+
+        runner._release_evicted_agent_soft = _soft_release
+        with runner._agent_cache_lock:
+            runner._agent_cache["slack:s1"] = (old_agent, "old-sig", 3)
+
+        self._evict_like_production(runner, "slack:s1")
+
+        # The narrow single-writer teardown is synchronous: once the helper
+        # returns, a replacement can safely call thread/resume.
+        assert events[0] == "codex-writer-closed"
+        assert soft_release_done.wait(timeout=2.0)
+        assert events == ["codex-writer-closed", "soft-release"]
