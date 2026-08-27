@@ -1,10 +1,11 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from agent.account_usage import (
     AccountUsageSnapshot,
     AccountUsageWindow,
     fetch_account_usage,
     render_account_usage_lines,
+    render_codex_usage_brief_lines,
 )
 
 
@@ -116,6 +117,63 @@ def test_render_account_usage_lines_includes_reset_and_provider():
     assert "openai-codex (Pro)" in lines[1]
     assert "Session: 75% remaining (25% used)" in lines[2]
     assert "Credits balance: $9.99" in lines[3]
+
+
+def test_render_codex_usage_brief_lines_shows_used_percent_and_reset_only():
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    snapshot = AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage_api",
+        fetched_at=now,
+        windows=(
+            AccountUsageWindow(
+                label="Session",
+                used_percent=20,
+                reset_at=now + timedelta(hours=4, minutes=30),
+            ),
+            AccountUsageWindow(
+                label="Weekly",
+                used_percent=3,
+                reset_at=now + timedelta(days=7, hours=3),
+            ),
+        ),
+        details=("Credits balance: $9.99",),
+    )
+
+    assert render_codex_usage_brief_lines(snapshot, now=now) == [
+        "Weekly usage: 3% used. Resets in 7d 3h.",
+        "5 hour usage: 20% used. Resets in 4h 30m.",
+    ]
+
+
+def test_render_codex_usage_brief_lines_preserves_window_specific_units():
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    snapshot = AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage_api",
+        fetched_at=now,
+        windows=(
+            AccountUsageWindow(label="Weekly", used_percent=10, reset_at=now + timedelta(hours=23)),
+            AccountUsageWindow(label="Session", used_percent=25, reset_at=now + timedelta(minutes=30)),
+        ),
+    )
+
+    assert render_codex_usage_brief_lines(snapshot, now=now) == [
+        "Weekly usage: 10% used. Resets in 0d 23h.",
+        "5 hour usage: 25% used. Resets in 0h 30m.",
+    ]
+
+
+def test_render_codex_usage_brief_lines_omits_window_without_reset():
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    snapshot = AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage_api",
+        fetched_at=now,
+        windows=(AccountUsageWindow(label="Weekly", used_percent=10),),
+    )
+
+    assert render_codex_usage_brief_lines(snapshot, now=now) == []
 
 
 def test_fetch_account_usage_openrouter_uses_limit_remaining_and_ignores_deprecated_rate_limit(monkeypatch):

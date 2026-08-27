@@ -29,7 +29,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from agent.account_usage import fetch_account_usage, render_account_usage_lines
+from agent.account_usage import (
+    fetch_account_usage,
+    render_account_usage_lines,
+    render_codex_usage_brief_lines,
+)
 from agent.i18n import t
 from agent.turn_context import extract_api_content_sidecar
 from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
@@ -5449,8 +5453,20 @@ class GatewaySlashCommandsMixin:
                 provider = persisted_route["billing_provider"]
                 base_url = persisted_route.get("billing_base_url")
             else:
-                provider = persisted.get("billing_provider")
-                base_url = persisted.get("billing_base_url")
+                provider = provider or persisted.get("billing_provider")
+                base_url = base_url or persisted.get("billing_base_url")
+
+        # A slash command can be the first event in a fresh session. Fall back
+        # to the configured model so /usage still queries the active provider.
+        if not provider:
+            try:
+                from gateway.run import _load_gateway_config
+
+                config = _load_gateway_config()
+                provider = cfg_get(config, "model", "provider")
+                base_url = base_url or cfg_get(config, "model", "base_url")
+            except Exception:
+                pass
 
         if wants_reset:
             normalized_provider = str(provider or "").strip().lower()
@@ -5482,7 +5498,12 @@ class GatewaySlashCommandsMixin:
             except Exception:
                 account_snapshot = None
             if account_snapshot:
+                compact_codex_lines = render_codex_usage_brief_lines(account_snapshot)
+                if compact_codex_lines:
+                    return "\n".join(compact_codex_lines)
                 account_lines = render_account_usage_lines(account_snapshot, markdown=True)
+            if str(provider).strip().lower() == "openai-codex":
+                return "Codex usage unavailable."
 
         # ── Nous credits magnitudes + monthly-grant % gauge ─────────────
         # Shared with the CLI / TUI /usage block via nous_credits_lines(): a single

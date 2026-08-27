@@ -144,10 +144,10 @@ class TestUsageAccountSection:
             lambda provider, base_url=None, api_key=None: object(),
         )
         monkeypatch.setattr(
-            "gateway.slash_commands.render_account_usage_lines",
-            lambda snapshot, markdown=False: [
-                "📈 **Account limits**",
-                "Provider: openai-codex (Pro)",
+            "gateway.slash_commands.render_codex_usage_brief_lines",
+            lambda snapshot: [
+                "Weekly usage: 3% used. Resets in 7d 3h.",
+                "5 hour usage: 20% used. Resets in 4h 30m.",
             ],
         )
         # The credits block routes through the shared nous_credits_lines() helper;
@@ -159,8 +159,10 @@ class TestUsageAccountSection:
 
         account_call = next(c for c in calls if c["args"] == ("openai-codex",))
         assert account_call["kwargs"]["base_url"] == "https://chatgpt.com/backend-api/codex"
-        assert "📊 **Session Info**" in result
-        assert "📈 **Account limits**" in result
+        assert result == (
+            "Weekly usage: 3% used. Resets in 7d 3h.\n"
+            "5 hour usage: 20% used. Resets in 4h 30m."
+        )
 
     @pytest.mark.asyncio
     async def test_usage_command_prefers_dominant_persisted_route(self, monkeypatch):
@@ -192,6 +194,10 @@ class TestUsageAccountSection:
         monkeypatch.setattr(
             "gateway.slash_commands.render_account_usage_lines",
             lambda snapshot, markdown=False: ["account limits"],
+        )
+        monkeypatch.setattr(
+            "gateway.slash_commands.render_codex_usage_brief_lines",
+            lambda snapshot: [],
         )
         monkeypatch.setattr("agent.account_usage.nous_credits_lines", lambda markdown=False: [])
 
