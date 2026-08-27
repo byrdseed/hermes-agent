@@ -7168,6 +7168,9 @@ class SlackAdapter(BasePlatformAdapter):
         # Resolve channel display name (cached after first lookup) so logs
         # and agent context show #channel / peer names instead of raw IDs.
         channel_name = await self._resolve_channel_name(channel_id, team_id=team_id)
+        channel_context_label = await self._resolve_channel_context(
+            channel_id, team_id=team_id
+        )
 
         # Slack's AI Agent Messages tab shows visible app threads; title the
         # first DM thread turn from the user's prompt when Slack AI APIs are
@@ -7188,6 +7191,7 @@ class SlackAdapter(BasePlatformAdapter):
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_ts,
+            chat_topic=channel_context_label,
             scope_id=str(team_id) if team_id else None,
             # Slack Workflow Builder / app posts arrive as
             # subtype=bot_message with user=None; flag them so the
@@ -8694,11 +8698,17 @@ class SlackAdapter(BasePlatformAdapter):
                 user_id,
             )
             return
+        channel_name = await self._resolve_channel_name(channel_id, team_id=team_id)
+        channel_context_label = await self._resolve_channel_context(
+            channel_id, team_id=team_id
+        )
         source = self.build_source(
             chat_id=channel_id,
+            chat_name=channel_name,
             chat_type="dm" if is_dm else "group",
             user_id=user_id,
             thread_id=thread_id,
+            chat_topic=channel_context_label,
             scope_id=team_id or None,
         )
 
