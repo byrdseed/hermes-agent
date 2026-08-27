@@ -1,8 +1,10 @@
 import random
+from datetime import datetime, timezone
 
 from gateway.status_phrases import (
     classify_status_context,
     choose_status_phrase,
+    format_long_running_status,
     resolve_status_phrase_catalog,
 )
 
@@ -11,6 +13,19 @@ def test_long_running_context_uses_status_bucket():
     assert classify_status_context("status") == "status"
     assert classify_status_context("heartbeat") == "status"
     assert classify_status_context("long_running") == "status"
+
+
+def test_slack_long_running_status_is_deterministic_hst_time():
+    now = datetime(2026, 8, 27, 12, 7, tzinfo=timezone.utc)
+
+    assert format_long_running_status(
+        "slack",
+        mode="generic",
+        elapsed_mins=9,
+        status_detail=" — computer",
+        generic_status="one sec, this is still going",
+        now=now,
+    ) == "Still working at 2:07 AM HST."
 
 
 def test_status_phrase_does_not_leak_raw_preview_or_args():

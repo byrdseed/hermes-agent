@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import random as _random
 from collections.abc import Mapping, MutableSequence
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -194,6 +195,26 @@ def classify_status_context(
     if normalized in {"heartbeat", "waiting", "long_running", "status"}:
         return "status"
     return "generic"
+
+
+def format_long_running_status(
+    platform_key: str,
+    *,
+    mode: str,
+    elapsed_mins: int,
+    status_detail: str,
+    generic_status: str,
+    now: datetime | None = None,
+) -> str:
+    """Render one long-running heartbeat for the active chat surface."""
+    if platform_key == "slack":
+        hst = timezone(timedelta(hours=-10), name="HST")
+        current = (now or datetime.now(timezone.utc)).astimezone(hst)
+        clock = current.strftime("%I:%M %p").lstrip("0")
+        return f"Still working at {clock} HST."
+    if mode == "generic":
+        return generic_status
+    return f"⏳ Working — {elapsed_mins} min{status_detail}"
 
 
 def choose_status_phrase(
