@@ -230,6 +230,15 @@ class TestRunConversationCodexPath:
         assert agent._iters_since_skill == 2
         assert agent._user_turn_count == 2
 
+    def test_interim_delivery_dedup_is_reset_for_each_turn(self, fake_session):
+        agent = _make_codex_agent()
+        agent._delivered_interim_texts = {"stale prior turn"}
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("hello")
+
+        assert "stale prior turn" not in agent._delivered_interim_texts
+
     def test_user_message_not_duplicated(self, fake_session):
         """Regression guard: the user message must appear exactly once in
         the messages list. The standard run_conversation pre-loop appends

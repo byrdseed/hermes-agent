@@ -923,6 +923,9 @@ def run_codex_app_server_turn(
 
     turn_session_id = str(getattr(agent, "session_id", "") or "").strip()
     binding = get_codex_runtime_binding(agent)
+    # Interim-delivery dedup is turn-scoped. Reused agents must not treat a
+    # repeated final from an earlier turn as already delivered in this turn.
+    agent._delivered_interim_texts = set()
     # A Codex thread is append-only and cannot cross a logical Hermes session.
     binding.bind(turn_session_id)
 
