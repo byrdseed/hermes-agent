@@ -48,6 +48,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     ProcessingOutcome,
+    ProcessingPhase,
     SendResult,
     SUPPORTED_DOCUMENT_TYPES,
     SUPPORTED_VIDEO_TYPES,
@@ -1249,11 +1250,14 @@ class SlackAdapter(BasePlatformAdapter):
         # thread session-key scoping.
         self._thread_rehydration_checked: set = set()
         self._THREAD_REHYDRATION_CHECKED_MAX = 5000
-        # Track message IDs that should get reaction lifecycle (DMs / @mentions).
-        # Entries are normally removed when the reaction completes, but an
-        # exception between add and finalize would leak them — keep it bounded.
-        self._reacting_message_ids: set = set()
-        self._REACTING_MESSAGE_IDS_MAX = 5000
+        # One workspace-scoped entry owns both lifecycle eligibility and the
+        # currently active emoji. ``None`` means eligible but no reaction is
+        # active (before start or after a failed Slack API call).
+        self._processing_reactions: Dict[Any, Optional[str]] = {}
+        self._processing_reaction_lock = asyncio.Lock()
+        self._PROCESSING_REACTIONS_MAX = 5000
+        self._PROCESSING_REACTION_REMOVE_ATTEMPTS = 3
+        self._PROCESSING_REACTION_RETRY_SECONDS = 0.1
         # Track active Assistant statuses by (team_id, channel_id, thread_ts)
         # so cleanup cannot clear an overlapping Slack Connect workspace.
         # Entries are popped when the status clears, but statuses abandoned
@@ -1391,6 +1395,21 @@ class SlackAdapter(BasePlatformAdapter):
         excess = len(mapping) - max_size // 2
         for old_key in list(mapping)[:excess]:
             del mapping[old_key]
+
+    def _trim_processing_reactions(self) -> None:
+        """Bound eligibility entries without forgetting live Slack state."""
+        if len(self._processing_reactions) <= self._PROCESSING_REACTIONS_MAX:
+            return
+        remove_count = (
+            len(self._processing_reactions) - self._PROCESSING_REACTIONS_MAX // 2
+        )
+        for marker, emoji in list(self._processing_reactions.items()):
+            if emoji is not None:
+                continue
+            del self._processing_reactions[marker]
+            remove_count -= 1
+            if remove_count == 0:
+                break
 
     @classmethod
     def _discard_oldest_by_thread_ts(
@@ -4471,43 +4490,98 @@ class SlackAdapter(BasePlatformAdapter):
             logger.debug("[Slack] reactions.remove failed (%s): %s", emoji, e)
             return False
 
+    async def _remove_processing_reaction(
+        self, channel: str, timestamp: str, emoji: str, team_id: str = ""
+    ) -> bool:
+        """Remove a lifecycle emoji, retrying transient Slack failures."""
+        for attempt in range(self._PROCESSING_REACTION_REMOVE_ATTEMPTS):
+            if await self._remove_reaction(channel, timestamp, emoji, team_id):
+                return True
+            if attempt + 1 < self._PROCESSING_REACTION_REMOVE_ATTEMPTS:
+                await asyncio.sleep(
+                    self._PROCESSING_REACTION_RETRY_SECONDS * (2**attempt)
+                )
+        return False
+
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
         return os.getenv("SLACK_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
+    _PROCESSING_PHASE_EMOJI = {
+        ProcessingPhase.STARTING: "eyes",
+        ProcessingPhase.THINKING: "brain",
+        ProcessingPhase.USING_TOOL: "computer",
+    }
+
+    async def set_processing_phase(
+        self,
+        channel_id: str,
+        message_id: str,
+        phase: ProcessingPhase,
+        scope_id: str = "",
+    ) -> bool:
+        """Render a semantic processing phase as a Slack reaction."""
+        async with self._processing_reaction_lock:
+            if not self._reactions_enabled() or not channel_id or not message_id:
+                return False
+            marker = self._workspace_message_marker(scope_id, message_id)
+            if marker not in self._processing_reactions:
+                return False
+            emoji = self._PROCESSING_PHASE_EMOJI.get(phase)
+            if not emoji:
+                return False
+            current = self._processing_reactions.get(marker)
+            if current == emoji:
+                return True
+            if current and not await self._remove_processing_reaction(
+                channel_id, message_id, current, scope_id
+            ):
+                return False
+            added = await self._add_reaction(
+                channel_id, message_id, emoji, scope_id
+            )
+            self._processing_reactions[marker] = emoji if added else None
+            return added
+
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add an in-progress reaction when message processing begins."""
-        if not self._reactions_enabled():
-            return
+        """Mark message processing as starting."""
         ts = getattr(event, "message_id", None)
         team_id = str(getattr(event.source, "scope_id", "") or "")
         marker = self._workspace_message_marker(team_id, ts) if ts else None
-        if not ts or marker not in self._reacting_message_ids:
+        if not ts or marker not in self._processing_reactions:
             return
         channel_id = getattr(event.source, "chat_id", None)
         if channel_id:
-            await self._add_reaction(channel_id, ts, "eyes", team_id)
+            await self.set_processing_phase(
+                channel_id, ts, ProcessingPhase.STARTING, team_id
+            )
 
     async def on_processing_complete(
         self, event: MessageEvent, outcome: ProcessingOutcome
     ) -> None:
-        """Swap the in-progress reaction for a final success/failure reaction."""
-        if not self._reactions_enabled():
-            return
+        """Clear the active phase and render a terminal outcome."""
         ts = getattr(event, "message_id", None)
         team_id = str(getattr(event.source, "scope_id", "") or "")
         marker = self._workspace_message_marker(team_id, ts) if ts else None
-        if not ts or marker not in self._reacting_message_ids:
+        if not ts or marker not in self._processing_reactions:
             return
-        self._reacting_message_ids.discard(marker)
         channel_id = getattr(event.source, "chat_id", None)
         if not channel_id:
+            self._processing_reactions.pop(marker, None)
             return
-        await self._remove_reaction(channel_id, ts, "eyes", team_id)
-        if outcome == ProcessingOutcome.SUCCESS:
-            await self._add_reaction(channel_id, ts, "white_check_mark", team_id)
-        elif outcome == ProcessingOutcome.FAILURE:
-            await self._add_reaction(channel_id, ts, "x", team_id)
+        async with self._processing_reaction_lock:
+            current = self._processing_reactions.get(marker)
+            if current and not await self._remove_processing_reaction(
+                channel_id, ts, current, team_id
+            ):
+                return
+            if outcome == ProcessingOutcome.SUCCESS:
+                await self._add_reaction(
+                    channel_id, ts, "white_check_mark", team_id
+                )
+            elif outcome == ProcessingOutcome.FAILURE:
+                await self._add_reaction(channel_id, ts, "x", team_id)
+            self._processing_reactions.pop(marker, None)
 
     # ----- User identity resolution -----
 
@@ -7279,17 +7353,10 @@ class SlackAdapter(BasePlatformAdapter):
             is_one_to_one_dm or is_mentioned or _free_response
         ) and self._reactions_enabled()
         if _should_react:
-            self._reacting_message_ids.add(
-                self._workspace_message_marker(team_id, ts)
+            self._processing_reactions.setdefault(
+                self._workspace_message_marker(team_id, ts), None
             )
-            if len(self._reacting_message_ids) > self._REACTING_MESSAGE_IDS_MAX:
-                # Entries embed a Slack message ts (bare or workspace-scoped
-                # tuple) — evict oldest first by the embedded ts.
-                self._discard_oldest_slack_timestamps(
-                    self._reacting_message_ids,
-                    len(self._reacting_message_ids)
-                    - self._REACTING_MESSAGE_IDS_MAX // 2,
-                )
+            self._trim_processing_reactions()
 
         # App-context is per-turn, user-controlled Slack UI state. Surface it
         # with the inbound user message rather than storing it on SessionSource:

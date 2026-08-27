@@ -11,7 +11,13 @@ import pytest
 
 import gateway.platforms.base as base_platform
 from gateway.config import Platform, PlatformConfig, StreamingConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    ProcessingPhase,
+    SendResult,
+)
 from gateway.session import SessionSource
 
 
@@ -69,6 +75,18 @@ class DiscordProgressCaptureAdapter(ProgressCaptureAdapter):
         from plugins.platforms.discord.adapter import DiscordAdapter
 
         return DiscordAdapter.format_tool_preview(self, preview, **kwargs)
+
+
+class PhaseCaptureSlackAdapter(ProgressCaptureAdapter):
+    def __init__(self):
+        super().__init__(platform=Platform.SLACK)
+        self.phases = []
+
+    async def set_processing_phase(
+        self, channel_id, message_id, phase, scope_id=""
+    ) -> bool:
+        self.phases.append((channel_id, message_id, phase, scope_id))
+        return True
 
 
 class MediaCaptureProgressAdapter(ProgressCaptureAdapter):
@@ -532,6 +550,66 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
     }
     assert adapter.sent[0]["metadata"] == expected_metadata
     assert all(call["metadata"] == expected_metadata for call in adapter.typing)
+
+
+@pytest.mark.asyncio
+async def test_slack_tool_phase_survives_all_progress_surfaces_off(
+    monkeypatch, tmp_path
+):
+    import yaml
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "display": {
+                    "platforms": {
+                        "slack": {
+                            "tool_progress": "off",
+                            "thinking_progress": "off",
+                            "live_status": "off",
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = PhaseCaptureSlackAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="D123",
+        chat_type="dm",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-phase-only",
+        session_key="agent:main:slack:dm:D123",
+        event_message_id="1234567890.000006",
+    )
+    await asyncio.sleep(0.01)
+
+    assert result["final_response"] == "done"
+    assert adapter.phases == [
+        ("D123", "1234567890.000006", ProcessingPhase.USING_TOOL, ""),
+        ("D123", "1234567890.000006", ProcessingPhase.USING_TOOL, ""),
+    ]
 
 
 @pytest.mark.asyncio

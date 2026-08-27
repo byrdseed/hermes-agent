@@ -2932,7 +2932,7 @@ class TestReactions:
         await adapter._handle_slack_message(event)
 
         # _handle_slack_message should register the message for reactions
-        assert "1234567890.000001" in adapter._reacting_message_ids
+        assert "1234567890.000001" in adapter._processing_reactions
 
         # Simulate the base class calling on_processing_start
         from gateway.platforms.base import MessageEvent, MessageType, SessionSource
@@ -2969,7 +2969,190 @@ class TestReactions:
         assert remove_calls[0].kwargs["name"] == "eyes"
 
         # Message ID should be cleaned up
-        assert "1234567890.000001" not in adapter._reacting_message_ids
+        assert "1234567890.000001" not in adapter._processing_reactions
+
+    @pytest.mark.asyncio
+    async def test_processing_reaction_tracks_semantic_phases(self, adapter):
+        adapter._app.client.reactions_add = AsyncMock()
+        adapter._app.client.reactions_remove = AsyncMock()
+        adapter._processing_reactions["1234567890.000004"] = None
+
+        from gateway.config import Platform
+        from gateway.platforms.base import (
+            MessageEvent,
+            MessageType,
+            ProcessingOutcome,
+            ProcessingPhase,
+            SessionSource,
+        )
+
+        event = MessageEvent(
+            text="build it",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="dm",
+                user_id="U_USER",
+            ),
+            message_id="1234567890.000004",
+        )
+
+        await adapter.on_processing_start(event)
+        await adapter.set_processing_phase(
+            "C123", event.message_id, ProcessingPhase.THINKING
+        )
+        await adapter.set_processing_phase(
+            "C123", event.message_id, ProcessingPhase.USING_TOOL
+        )
+        await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        assert [
+            call.kwargs["name"]
+            for call in adapter._app.client.reactions_add.await_args_list
+        ] == ["eyes", "brain", "computer", "white_check_mark"]
+        assert [
+            call.kwargs["name"]
+            for call in adapter._app.client.reactions_remove.await_args_list
+        ] == ["eyes", "brain", "computer"]
+        assert event.message_id not in adapter._processing_reactions
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("outcome", "terminal_emoji"),
+        [("FAILURE", "x"), ("CANCELLED", None)],
+    )
+    async def test_processing_completion_renders_terminal_outcome(
+        self, adapter, outcome, terminal_emoji
+    ):
+        from gateway.config import Platform
+        from gateway.platforms.base import (
+            MessageEvent,
+            ProcessingOutcome,
+            SessionSource,
+        )
+
+        message_id = f"terminal-{outcome.lower()}"
+        adapter._processing_reactions[message_id] = "computer"
+        adapter._remove_reaction = AsyncMock(return_value=True)
+        adapter._add_reaction = AsyncMock(return_value=True)
+        event = MessageEvent(
+            text="build it",
+            source=SessionSource(
+                platform=Platform.SLACK, chat_id="C123", chat_type="dm"
+            ),
+            message_id=message_id,
+        )
+
+        await adapter.on_processing_complete(
+            event, getattr(ProcessingOutcome, outcome)
+        )
+
+        adapter._remove_reaction.assert_awaited_once_with(
+            "C123", message_id, "computer", ""
+        )
+        if terminal_emoji:
+            adapter._add_reaction.assert_awaited_once_with(
+                "C123", message_id, terminal_emoji, ""
+            )
+        else:
+            adapter._add_reaction.assert_not_awaited()
+        assert message_id not in adapter._processing_reactions
+
+    @pytest.mark.asyncio
+    async def test_failed_phase_swap_keeps_old_emoji_for_completion(self, adapter):
+        from gateway.platforms.base import ProcessingPhase
+
+        message_id = "1234567890.000005"
+        adapter._processing_reactions[message_id] = "eyes"
+        adapter._PROCESSING_REACTION_RETRY_SECONDS = 0
+        adapter._remove_reaction = AsyncMock(side_effect=[False, False, False])
+        adapter._add_reaction = AsyncMock(return_value=True)
+
+        assert not await adapter.set_processing_phase(
+            "C123", message_id, ProcessingPhase.THINKING
+        )
+        assert adapter._processing_reactions[message_id] == "eyes"
+        adapter._add_reaction.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_failed_completion_removal_retains_owned_emoji(self, adapter):
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageEvent, ProcessingOutcome, SessionSource
+
+        message_id = "1234567890.000006"
+        adapter._processing_reactions[message_id] = "computer"
+        adapter._PROCESSING_REACTION_RETRY_SECONDS = 0
+        adapter._remove_reaction = AsyncMock(return_value=False)
+        adapter._add_reaction = AsyncMock(return_value=True)
+        event = MessageEvent(
+            text="build it",
+            source=SessionSource(
+                platform=Platform.SLACK, chat_id="C123", chat_type="dm"
+            ),
+            message_id=message_id,
+        )
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        assert adapter._remove_reaction.await_count == 3
+        adapter._add_reaction.assert_not_awaited()
+        assert adapter._processing_reactions[message_id] == "computer"
+
+    @pytest.mark.asyncio
+    async def test_cancelled_cleanup_keeps_emoji_owned_for_retry(self, adapter):
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageEvent, ProcessingOutcome, SessionSource
+
+        message_id = "1234567890.000007"
+        adapter._processing_reactions[message_id] = "computer"
+        removal_started = asyncio.Event()
+
+        async def suspended_remove(*args, **kwargs):
+            removal_started.set()
+            await asyncio.Future()
+
+        adapter._remove_reaction = suspended_remove
+        event = MessageEvent(
+            text="build it",
+            source=SessionSource(
+                platform=Platform.SLACK, chat_id="C123", chat_type="dm"
+            ),
+            message_id=message_id,
+        )
+
+        completion = asyncio.create_task(
+            adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        )
+        await removal_started.wait()
+        completion.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await completion
+
+        assert adapter._processing_reactions[message_id] == "computer"
+
+        adapter._remove_reaction = AsyncMock(return_value=True)
+        await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
+        assert message_id not in adapter._processing_reactions
+
+    def test_processing_reaction_trim_preserves_owned_emojis(self, adapter):
+        adapter._PROCESSING_REACTIONS_MAX = 4
+        adapter._processing_reactions.update(
+            {
+                "old-active": "eyes",
+                "old-eligible": None,
+                "middle-eligible": None,
+                "new-active": "computer",
+                "new-eligible": None,
+            }
+        )
+
+        adapter._trim_processing_reactions()
+
+        assert adapter._processing_reactions == {
+            "old-active": "eyes",
+            "new-active": "computer",
+        }
 
     @pytest.mark.asyncio
     async def test_free_response_channel_message_is_registered_for_reactions(
@@ -2986,7 +3169,7 @@ class TestReactions:
 
         await adapter._handle_slack_message(event)
 
-        assert "1234567890.000002" in adapter._reacting_message_ids
+        assert "1234567890.000002" in adapter._processing_reactions
 
     @pytest.mark.asyncio
     async def test_unmentioned_group_dm_is_not_registered_for_reactions(
@@ -3003,7 +3186,7 @@ class TestReactions:
 
         await adapter._handle_slack_message(event)
 
-        assert "1234567890.000003" not in adapter._reacting_message_ids
+        assert "1234567890.000003" not in adapter._processing_reactions
 
 
 class TestSlackChannelMetadata:
