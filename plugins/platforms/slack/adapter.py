@@ -1255,6 +1255,7 @@ class SlackAdapter(BasePlatformAdapter):
         # active (before start or after a failed Slack API call).
         self._processing_reactions: Dict[Any, Optional[str]] = {}
         self._processing_reaction_lock = asyncio.Lock()
+        self._processing_cleanup_tasks: set[asyncio.Task] = set()
         self._PROCESSING_REACTIONS_MAX = 5000
         self._PROCESSING_REACTION_REMOVE_ATTEMPTS = 3
         self._PROCESSING_REACTION_RETRY_SECONDS = 0.1
@@ -4503,6 +4504,23 @@ class SlackAdapter(BasePlatformAdapter):
                 )
         return False
 
+    async def _retry_terminal_processing_cleanup(
+        self,
+        *,
+        channel_id: str,
+        message_id: str,
+        marker: Any,
+        emoji: str,
+        team_id: str,
+    ) -> None:
+        """Make one bounded deferred cleanup pass, then evict local ownership."""
+        await self._remove_processing_reaction(
+            channel_id, message_id, emoji, team_id
+        )
+        async with self._processing_reaction_lock:
+            if self._processing_reactions.get(marker) == emoji:
+                self._processing_reactions.pop(marker, None)
+
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
         return os.getenv("SLACK_REACTIONS", "true").lower() not in {"false", "0", "no"}
@@ -4574,6 +4592,17 @@ class SlackAdapter(BasePlatformAdapter):
             if current and not await self._remove_processing_reaction(
                 channel_id, ts, current, team_id
             ):
+                cleanup = asyncio.create_task(
+                    self._retry_terminal_processing_cleanup(
+                        channel_id=channel_id,
+                        message_id=ts,
+                        marker=marker,
+                        emoji=current,
+                        team_id=team_id,
+                    )
+                )
+                self._processing_cleanup_tasks.add(cleanup)
+                cleanup.add_done_callback(self._processing_cleanup_tasks.discard)
                 return
             if outcome == ProcessingOutcome.SUCCESS:
                 await self._add_reaction(
@@ -4789,6 +4818,22 @@ class SlackAdapter(BasePlatformAdapter):
         cache_key = (team_id, str(channel_id))
         await self._resolve_channel_name(channel_id, team_id=team_id)
         return self._channel_context_cache.get(cache_key)
+
+    def _configured_channel_context_filename(
+        self, channel_id: str, team_id: str = ""
+    ) -> Optional[str]:
+        """Return the operator-authorized context file for this Slack channel."""
+        mapping = self.config.extra.get("channel_context_files") or {}
+        if not isinstance(mapping, dict):
+            return None
+        channel_id = str(channel_id or "").strip()
+        team_id = str(team_id or "").strip()
+        value = mapping.get(f"{team_id}:{channel_id}") if team_id else None
+        if value is None:
+            value = mapping.get(channel_id)
+        if value is None:
+            return None
+        return str(value).strip() or None
 
     def _load_topic_context_file(self, topic: Optional[str]) -> Optional[str]:
         """Load a topic-named Markdown file from the configured safe directory."""
@@ -7296,7 +7341,9 @@ class SlackAdapter(BasePlatformAdapter):
                 if _channel_prompt
                 else _identity_prompt
             )
-        _topic_context_prompt = self._load_topic_context_file(channel_context_label)
+        _topic_context_prompt = self._load_topic_context_file(
+            self._configured_channel_context_filename(channel_id, team_id)
+        )
         _auto_skill = resolve_channel_skills(
             self.config.extra,
             channel_id,
@@ -8779,7 +8826,9 @@ class SlackAdapter(BasePlatformAdapter):
             scope_id=team_id or None,
         )
 
-        _topic_context_prompt = self._load_topic_context_file(channel_context_label)
+        _topic_context_prompt = self._load_topic_context_file(
+            self._configured_channel_context_filename(channel_id, team_id)
+        )
 
         event = MessageEvent(
             text=text,

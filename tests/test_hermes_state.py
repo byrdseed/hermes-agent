@@ -109,6 +109,14 @@ def test_codex_thread_binding_round_trip(db):
     assert db.set_codex_thread_id("missing", "thread-456") is False
 
 
+def test_codex_thread_column_is_append_only_for_recovery_compatibility(db):
+    columns = [
+        row[1]
+        for row in db._conn.execute("PRAGMA table_info(sessions)").fetchall()
+    ]
+    assert columns[-1] == "codex_thread_id"
+
+
 def test_transcript_mutation_invalidates_codex_thread_binding(db):
     db.create_session("codex-mutation", source="slack")
     first_user_id = db.append_message("codex-mutation", "user", "first")

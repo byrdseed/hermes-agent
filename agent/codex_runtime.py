@@ -867,6 +867,25 @@ def _persist_codex_thread_binding(
         )
 
 
+def _projected_messages_for_persistence(
+    turn: Any, *, response_previewed: bool
+) -> list[dict]:
+    """Exclude an unseen partial final while retaining visible/tool history."""
+    projected = [dict(message) for message in (turn.projected_messages or [])]
+    final_text = str(getattr(turn, "final_text", "") or "").strip()
+    if getattr(turn, "error", None) is None or not final_text or response_previewed:
+        return projected
+    for index in range(len(projected) - 1, -1, -1):
+        message = projected[index]
+        if (
+            message.get("role") == "assistant"
+            and str(message.get("content") or "").strip() == final_text
+        ):
+            del projected[index]
+            break
+    return projected
+
+
 def run_codex_app_server_turn(
     agent,
     *,
@@ -1064,13 +1083,30 @@ def run_codex_app_server_turn(
         )
         binding.retire(preserve_thread=True)
 
+    # Determine whether Codex's terminal text already reached the user before
+    # deciding what may become durable history.
+    response_previewed = False
+    if turn.final_text:
+        delivered = getattr(agent, "_interim_text_was_delivered", None)
+        if callable(delivered):
+            try:
+                response_previewed = bool(delivered(turn.final_text))
+            except Exception:
+                logger.debug(
+                    "codex app-server final-preview check failed",
+                    exc_info=True,
+                )
+    projected_for_persistence = _projected_messages_for_persistence(
+        turn, response_previewed=response_previewed
+    )
+
     # Splice projected messages into the conversation. The projector emits
     # standard {role, content, tool_calls, tool_call_id} entries, which
     # is exactly what curator.py / sessions DB expect.
-    if turn.projected_messages:
+    if projected_for_persistence:
         from agent.message_metadata import append_message
 
-        for projected_message in turn.projected_messages:
+        for projected_message in projected_for_persistence:
             append_message(messages, projected_message)
 
         # Persist the newly-projected assistant/tool messages ourselves.
@@ -1164,24 +1200,6 @@ def run_codex_app_server_turn(
             )
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
-
-    # The app-server event bridge surfaces every completed agentMessage so
-    # commentary appears before the following tool call. The last such item is
-    # also Codex's final response, which means it may already be visible when
-    # run_turn() returns. Preserve that exact-text fact for the gateway's
-    # duplicate-reply suppression; unrelated commentary must never suppress a
-    # different final answer.
-    response_previewed = False
-    if turn.final_text:
-        delivered = getattr(agent, "_interim_text_was_delivered", None)
-        if callable(delivered):
-            try:
-                response_previewed = bool(delivered(turn.final_text))
-            except Exception:
-                logger.debug(
-                    "codex app-server final-preview check failed",
-                    exc_info=True,
-                )
 
     return {
         "final_response": turn.final_text,

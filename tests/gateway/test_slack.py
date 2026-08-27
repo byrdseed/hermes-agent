@@ -272,6 +272,7 @@ class TestSlashCommandSessionIsolation:
         self, adapter, tmp_path
     ):
         adapter.config.extra["channel_context_dir"] = str(tmp_path)
+        adapter.config.extra["channel_context_files"] = {"C123": "curriculum.md"}
         (tmp_path / "curriculum.md").write_text(
             "# Curriculum\nHandle curriculum work here.", encoding="utf-8"
         )
@@ -3076,7 +3077,7 @@ class TestReactions:
         adapter._add_reaction.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_failed_completion_removal_retains_owned_emoji(self, adapter):
+    async def test_failed_completion_removal_retries_then_evicts_owned_emoji(self, adapter):
         from gateway.config import Platform
         from gateway.platforms.base import MessageEvent, ProcessingOutcome, SessionSource
 
@@ -3098,6 +3099,11 @@ class TestReactions:
         assert adapter._remove_reaction.await_count == 3
         adapter._add_reaction.assert_not_awaited()
         assert adapter._processing_reactions[message_id] == "computer"
+
+        await asyncio.gather(*list(adapter._processing_cleanup_tasks))
+
+        assert adapter._remove_reaction.await_count == 6
+        assert message_id not in adapter._processing_reactions
 
     @pytest.mark.asyncio
     async def test_cancelled_cleanup_keeps_emoji_owned_for_retry(self, adapter):
@@ -3196,6 +3202,7 @@ class TestSlackChannelMetadata:
     ):
         adapter.config.extra["free_response_channels"] = "C123"
         adapter.config.extra["channel_context_dir"] = str(tmp_path)
+        adapter.config.extra["channel_context_files"] = {"C123": "curriculum.md"}
         (tmp_path / "curriculum.md").write_text(
             "# Curriculum\nHandle curriculum work here.", encoding="utf-8"
         )
@@ -3227,19 +3234,21 @@ class TestSlackChannelMetadata:
         assert "# Curriculum" not in (message.channel_prompt or "")
 
     @pytest.mark.asyncio
-    async def test_topic_cannot_escape_channel_context_directory(
+    async def test_channel_topic_cannot_select_another_channels_context_file(
         self, adapter, tmp_path
     ):
         adapter.config.extra["free_response_channels"] = "C123"
         adapter.config.extra["channel_context_dir"] = str(tmp_path)
-        outside = tmp_path.parent / "outside.md"
-        outside.write_text("must not load", encoding="utf-8")
+        adapter.config.extra["channel_context_files"] = {
+            "T999:C999": "private.md"
+        }
+        (tmp_path / "private.md").write_text("must not load", encoding="utf-8")
         adapter._app.client.conversations_info = AsyncMock(
             return_value={
                 "ok": True,
                 "channel": {
                     "name": "curriculum",
-                    "topic": {"value": "../outside.md"},
+                    "topic": {"value": "private.md"},
                 },
             }
         )
@@ -3255,7 +3264,8 @@ class TestSlackChannelMetadata:
         )
 
         message = adapter.handle_message.await_args.args[0]
-        assert message.source.chat_topic == "../outside.md"
+        assert message.source.chat_topic == "private.md"
+        assert "must not load" not in (message.auto_context or "")
         assert "must not load" not in (message.channel_prompt or "")
 
     @pytest.mark.asyncio

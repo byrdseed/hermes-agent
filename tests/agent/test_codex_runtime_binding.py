@@ -1,4 +1,9 @@
-from agent.codex_runtime import CodexRuntimeBinding
+from types import SimpleNamespace
+
+from agent.codex_runtime import (
+    CodexRuntimeBinding,
+    _projected_messages_for_persistence,
+)
 
 
 class _Client:
@@ -81,3 +86,22 @@ def test_client_factory_gets_durable_thread_and_controls_live_requests():
     assert created_with == ["thread-from-db"]
     assert client.interrupts == 1
     assert client.steers == ["change course"]
+
+
+def test_unseen_partial_final_is_not_persisted():
+    turn = SimpleNamespace(
+        error="timed out",
+        final_text="I'm continuing.",
+        projected_messages=[
+            {"role": "assistant", "content": "Visible setup"},
+            {"role": "tool", "content": "partial result", "tool_call_id": "call-1"},
+            {"role": "assistant", "content": "I'm continuing."},
+        ],
+    )
+
+    projected = _projected_messages_for_persistence(turn, response_previewed=False)
+
+    assert projected == [
+        {"role": "assistant", "content": "Visible setup"},
+        {"role": "tool", "content": "partial result", "tool_call_id": "call-1"},
+    ]
