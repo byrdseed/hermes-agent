@@ -2471,6 +2471,12 @@ class MessageEvent:
     # Proactive plugin events set this to False so untrusted payload text
     # remains conversational input.
     allow_gateway_control: bool = True
+
+    # Canonical execution outcome supplied by GatewayRunner. When set, this
+    # takes precedence over delivery success so a delivered failure notice is
+    # still reported as a failed turn and an intentional interrupt is
+    # reported as cancelled.
+    processing_outcome_override: Optional[ProcessingOutcome] = None
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -6919,8 +6925,17 @@ class BasePlatformAdapter(ABC):
                         self.name, len(_response_pre_extract), event.source.chat_id,
                     )
 
-            # Determine overall success for the processing hook
+            # Determine overall success for the processing hook. Agent
+            # execution truth, when supplied, takes precedence over whether a
+            # terminal notice was successfully delivered.
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            processing_outcome = event.processing_outcome_override
+            if processing_outcome is None:
+                processing_outcome = (
+                    ProcessingOutcome.SUCCESS
+                    if processing_ok
+                    else ProcessingOutcome.FAILURE
+                )
             # Clean up the per-turn streaming-TTS flag (#60671).
             self._streaming_tts_completed_turns.discard(
                 self._streaming_tts_turn_key(
@@ -6933,7 +6948,7 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook(
                 "on_processing_complete",
                 event,
-                ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
+                processing_outcome,
             )
 
             # The active drain owns debounce state. If a queue-mode timer has

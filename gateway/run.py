@@ -43,6 +43,7 @@ import time
 import traceback
 from collections import OrderedDict
 from contextvars import Context, copy_context
+from enum import Enum
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
@@ -2688,6 +2689,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
@@ -4017,6 +4019,30 @@ import weakref as _weakref
 _gateway_runner_ref: _weakref.ref = lambda: None
 
 
+class AgentTurnOutcome(Enum):
+    """Canonical interpretation of conversation-loop result flags."""
+
+    SUCCESS = "success"
+    INTERRUPTED = "interrupted"
+    INCOMPLETE = "incomplete"
+
+
+def classify_agent_turn_outcome(agent_result: Any) -> AgentTurnOutcome:
+    """Classify a turn once, with interruption taking precedence."""
+    if not isinstance(agent_result, dict):
+        return AgentTurnOutcome.INCOMPLETE
+    if agent_result.get("interrupted"):
+        return AgentTurnOutcome.INTERRUPTED
+    if (
+        agent_result.get("failed")
+        or agent_result.get("partial")
+        or agent_result.get("error")
+        or agent_result.get("completed") is False
+    ):
+        return AgentTurnOutcome.INCOMPLETE
+    return AgentTurnOutcome.SUCCESS
+
+
 def _normalize_empty_agent_response(
     agent_result: dict,
     response: str,
@@ -4036,6 +4062,18 @@ def _normalize_empty_agent_response(
     leaving the platform with nothing to send. (#31884)
     """
     if response:
+        return response
+
+    turn_outcome = classify_agent_turn_outcome(agent_result)
+    api_calls = int(agent_result.get("api_calls", 0) or 0)
+    if turn_outcome is AgentTurnOutcome.INTERRUPTED:
+        # A stopped run that did work is intentionally silent. A zero-call
+        # interruption never processed the user's message, so surface it.
+        if api_calls == 0:
+            return (
+                "⚠️ Your message was interrupted before processing started "
+                "(likely by a recent /stop). Please send it again."
+            )
         return response
 
     if agent_result.get("failed"):
@@ -4081,22 +4119,6 @@ def _normalize_empty_agent_response(
             "Try again or use /reset to start a fresh session."
         )
 
-    api_calls = int(agent_result.get("api_calls", 0) or 0)
-    if agent_result.get("interrupted"):
-        # An interrupted run that did work (api_calls > 0) is the drain of a
-        # run the user deliberately stopped or steered — its silence is
-        # intentional, and any queued/interrupting message is delivered by
-        # the recursive drain inside _run_agent before this result is seen.
-        # An interrupted run with ZERO api_calls never processed the user's
-        # message at all: it was killed at the top of the tool loop by an
-        # interrupt flag left over from a recent /stop (#44212).  Pure
-        # silence there swallows a real user message, so surface it.
-        if api_calls == 0:
-            return (
-                "⚠️ Your message was interrupted before processing started "
-                "(likely by a recent /stop). Please send it again."
-            )
-        return response
     if api_calls > 0:
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             return ""
@@ -4160,15 +4182,7 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     the marker in that case loses the recovery signal and startup auto-resume
     has nothing to schedule.
     """
-    if not isinstance(agent_result, dict):
-        return False
-    if agent_result.get("interrupted"):
-        return False
-    if agent_result.get("failed") or agent_result.get("partial") or agent_result.get("error"):
-        return False
-    if agent_result.get("completed") is False:
-        return False
-    return True
+    return classify_agent_turn_outcome(agent_result) is AgentTurnOutcome.SUCCESS
 
 
 def _preserve_queued_followup_history_offset(
@@ -20861,6 +20875,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
                 return None
 
+            turn_outcome = classify_agent_turn_outcome(agent_result)
+            if turn_outcome is AgentTurnOutcome.INCOMPLETE:
+                event.processing_outcome_override = ProcessingOutcome.FAILURE
+            elif turn_outcome is AgentTurnOutcome.INTERRUPTED:
+                event.processing_outcome_override = ProcessingOutcome.CANCELLED
+
             response = agent_result.get("final_response") or ""
             # Hidden-reasoning-only retry exhaustion: the loop's sentinel text
             # ("Codex response remained incomplete after 3 continuation
@@ -20914,7 +20934,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # shutdown) — the turn ran to completion, so recovery
             # succeeded and subsequent messages should no longer receive
             # the restart-interruption system note.
-            if session_key and _should_clear_resume_pending_after_turn(agent_result):
+            if session_key and turn_outcome is AgentTurnOutcome.SUCCESS:
                 await self._clear_restart_failure_count(session_key)
                 try:
                     await self.async_session_store.clear_resume_pending(session_key)
@@ -21411,7 +21431,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # content the user hasn't seen (streaming only sent earlier
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
-            if agent_result.get("already_sent") and not agent_result.get("failed"):
+            if (
+                agent_result.get("already_sent")
+                and turn_outcome is AgentTurnOutcome.SUCCESS
+            ):
                 if response:
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
