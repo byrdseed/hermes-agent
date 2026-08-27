@@ -4571,6 +4571,10 @@ class AIAgent:
         """Retire the subprocess while preserving its resumable thread id."""
         self._get_codex_runtime_binding().retire(preserve_thread=True)
 
+    def _invalidate_codex_runtime_thread(self) -> None:
+        """Drop live Codex state after the authoritative transcript is rewritten."""
+        self._get_codex_runtime_binding().retire(preserve_thread=False)
+
     def release_clients(self) -> None:
         """Release LLM client resources WITHOUT tearing down session tool state.
 

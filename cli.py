@@ -10349,6 +10349,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         self.conversation_history = truncated
         if self.agent is not None:
+            invalidate_codex = getattr(
+                self.agent, "_invalidate_codex_runtime_thread", None
+            )
+            if callable(invalidate_codex):
+                invalidate_codex()
             if hasattr(self.agent, "_session_messages"):
                 self.agent._session_messages = self.conversation_history
             if hasattr(self.agent, "_last_flushed_db_idx"):
@@ -10453,6 +10458,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Agent surgery: invalidate the system-prompt cache and reset the
         # flush index so the next turn re-flushes from the truncated head.
         if self.agent is not None:
+            invalidate_codex = getattr(
+                self.agent, "_invalidate_codex_runtime_thread", None
+            )
+            if callable(invalidate_codex):
+                invalidate_codex()
             if hasattr(self.agent, "_invalidate_system_prompt"):
                 try:
                     self.agent._invalidate_system_prompt()

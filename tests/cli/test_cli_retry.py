@@ -61,6 +61,24 @@ def test_retry_last_truncates_history_before_requeueing_message():
     ]
 
 
+@pytest.mark.parametrize("operation", ["retry", "undo"])
+def test_transcript_rewrite_invalidates_live_codex_thread(operation):
+    cli = _make_cli()
+    cli._session_db = None
+    cli.conversation_history = [
+        {"role": "user", "content": "rewrite me"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    cli.agent = MagicMock()
+
+    if operation == "retry":
+        assert cli.retry_last() == "rewrite me"
+    else:
+        cli.undo_last(prefill=False)
+
+    cli.agent._invalidate_codex_runtime_thread.assert_called_once_with()
+
+
 def test_process_command_retry_requeues_original_message_not_retry_command():
     cli = _make_cli()
     cli._session_db = None
