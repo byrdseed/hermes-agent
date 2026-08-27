@@ -3691,6 +3691,9 @@ def _rewind_active_session_history(
     session["history_version"] = int(session.get("history_version", 0)) + 1
     agent = session.get("agent")
     if agent is not None:
+        invalidate_codex = getattr(agent, "_invalidate_codex_runtime_thread", None)
+        if callable(invalidate_codex):
+            invalidate_codex()
         agent._session_messages = installed
         if hasattr(agent, "_last_flushed_db_idx"):
             agent._last_flushed_db_idx = len(installed) if persisted else 0
