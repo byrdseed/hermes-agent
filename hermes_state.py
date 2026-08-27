@@ -9058,6 +9058,52 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
         return dict(row) if row else None
 
+    def get_codex_thread_id(self, session_id: str) -> Optional[str]:
+        """Return the durable Codex app-server thread bound to a session."""
+        if not session_id:
+            return None
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT codex_thread_id FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if not row:
+            return None
+        value = row[0] if not isinstance(row, sqlite3.Row) else row["codex_thread_id"]
+        cleaned = str(value or "").strip()
+        return cleaned or None
+
+    def set_codex_thread_id(self, session_id: str, thread_id: str) -> bool:
+        """Persist the Codex app-server thread that owns session context."""
+        session_id = str(session_id or "").strip()
+        thread_id = str(thread_id or "").strip()
+        if not session_id or not thread_id:
+            return False
+
+        def _do(conn):
+            result = conn.execute(
+                "UPDATE sessions SET codex_thread_id = ? WHERE id = ?",
+                (thread_id, session_id),
+            )
+            return result.rowcount > 0
+
+        return bool(self._execute_write(_do))
+
+    def clear_codex_thread_id(self, session_id: str) -> bool:
+        """Detach stale Codex context after a transcript rewrite or rewind."""
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return False
+
+        def _do(conn):
+            result = conn.execute(
+                "UPDATE sessions SET codex_thread_id = NULL WHERE id = ?",
+                (session_id,),
+            )
+            return result.rowcount > 0
+
+        return bool(self._execute_write(_do))
+
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
 
@@ -11172,7 +11218,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     (session_id,),
                 )
             conn.execute(
-                "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
+                "UPDATE sessions SET message_count = 0, tool_call_count = 0, "
+                "codex_thread_id = NULL WHERE id = ?",
                 (session_id,),
             )
             total_messages, total_tool_calls = self._insert_message_rows(
@@ -12539,8 +12586,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 inserted = conn.execute("SELECT last_insert_rowid()").fetchone()
                 replacement_message_id = int(inserted[0])
             conn.execute(
-                "UPDATE sessions SET rewind_count = COALESCE(rewind_count, 0) + 1 "
-                "WHERE id = ?",
+                "UPDATE sessions SET rewind_count = COALESCE(rewind_count, 0) + 1, "
+                "codex_thread_id = NULL WHERE id = ?",
                 (session_id,),
             )
             message_count, tool_call_count = self._active_transcript_counts(

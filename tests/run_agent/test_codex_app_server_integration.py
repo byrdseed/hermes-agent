@@ -658,6 +658,135 @@ class TestSessionRetirementOnRunAgent:
         assert result["partial"] is True
         assert result["error"] == "turn timed out after 600.0s"
 
+    def test_replacement_session_resumes_retired_thread(self, monkeypatch):
+        """A watchdog retirement must not turn the next user message into a
+        context-empty Codex thread."""
+        resume_ids = []
+        turns = {"count": 0}
+
+        def fake_init(self, **kwargs):
+            resume_ids.append(kwargs.get("resume_thread_id"))
+
+        def fake_run_turn(self, user_input, **kwargs):
+            turns["count"] += 1
+            return TurnResult(
+                final_text="done" if turns["count"] == 2 else "",
+                projected_messages=[],
+                interrupted=turns["count"] == 1,
+                error="watchdog retired worker" if turns["count"] == 1 else None,
+                turn_id=f"turn-{turns['count']}",
+                thread_id="thread-continuity-1",
+                should_retire=turns["count"] == 1,
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(CodexAppServerSession, "close", lambda self: None)
+
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            first = agent.run_conversation("continue the task")
+            second = agent.run_conversation("did you finish?")
+
+        assert first["partial"] is True
+        assert second["completed"] is True
+        assert resume_ids == [None, "thread-continuity-1"]
+
+    def test_gateway_restart_loads_and_updates_durable_thread(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("session-continuity", source="slack")
+        db.set_codex_thread_id("session-continuity", "thread-before-restart")
+        captured = {}
+
+        def fake_init(self, **kwargs):
+            captured.update(kwargs)
+
+        def fake_run_turn(self, user_input, **kwargs):
+            return TurnResult(
+                final_text="still here",
+                projected_messages=[
+                    {"role": "assistant", "content": "still here"}
+                ],
+                turn_id="turn-after-restart",
+                thread_id="thread-after-restart",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+
+        try:
+            agent = _make_codex_agent(
+                session_id="session-continuity",
+                session_db=db,
+            )
+            with patch.object(
+                agent, "_spawn_background_review", return_value=None
+            ):
+                result = agent.run_conversation("did you finish?")
+
+            assert result["completed"] is True
+            assert captured["resume_thread_id"] == "thread-before-restart"
+            assert db.get_codex_thread_id("session-continuity") == (
+                "thread-after-restart"
+            )
+        finally:
+            db.close()
+
+    def test_logical_session_boundary_never_reuses_prior_thread(
+        self, monkeypatch
+    ):
+        resume_ids = []
+        closes = {"count": 0}
+
+        def fake_init(self, **kwargs):
+            resume_ids.append(kwargs.get("resume_thread_id"))
+
+        def fake_run_turn(self, user_input, **kwargs):
+            return TurnResult(
+                final_text="done",
+                projected_messages=[],
+                turn_id="turn-1",
+                thread_id=f"thread-{user_input}",
+            )
+
+        def fake_close(self):
+            closes["count"] += 1
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(CodexAppServerSession, "close", fake_close)
+
+        agent = _make_codex_agent(session_id="session-a")
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("a")
+            agent.session_id = "session-b"
+            agent.run_conversation("b")
+
+        assert resume_ids == [None, None]
+        assert closes["count"] == 1
+        assert agent._codex_session_owner_id == "session-b"
+        assert agent._codex_resume_thread_id == "thread-b"
+
+    def test_soft_release_closes_resumable_worker(self, monkeypatch):
+        closes = {"count": 0}
+
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "close",
+            lambda self: closes.__setitem__("count", closes["count"] + 1),
+        )
+        agent = _make_codex_agent()
+        agent._codex_session = CodexAppServerSession()
+
+        agent.release_clients()
+
+        assert closes["count"] == 1
+        assert agent._codex_session is None
+
     def test_normal_turn_keeps_session(self, fake_session):
         """fake_session fixture returns should_retire=False (default).
         The session must stay attached for the next turn to reuse."""

@@ -282,6 +282,7 @@ class CodexAppServerSession:
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
+        resume_thread_id: Optional[str] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
@@ -299,6 +300,7 @@ class CodexAppServerSession:
 
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
+        self._resume_thread_id = str(resume_thread_id or "").strip() or None
         self._interrupt_event = threading.Event()
         self._active_turn_id: Optional[str] = None
         self._active_turn_lock = threading.Lock()
@@ -311,6 +313,11 @@ class CodexAppServerSession:
         self._closed = False
 
     # ---------- lifecycle ----------
+
+    @property
+    def thread_id(self) -> Optional[str]:
+        """Return the live or requested thread id without starting a turn."""
+        return self._thread_id or self._resume_thread_id
 
     def ensure_started(self) -> str:
         """Spawn the subprocess, do the initialize handshake, and start a
@@ -343,7 +350,11 @@ class CodexAppServerSession:
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
-        result = self._client.request("thread/start", params, timeout=15)
+        method = "thread/start"
+        if self._resume_thread_id:
+            method = "thread/resume"
+            params = {"threadId": self._resume_thread_id, "cwd": self._cwd}
+        result = self._client.request(method, params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
         # tolerance fix so future codex drops/renames don't KeyError us
@@ -359,13 +370,14 @@ class CodexAppServerSession:
             raise CodexAppServerError(
                 code=-32603,
                 message=(
-                    "codex thread/start returned no thread id "
+                    f"codex {method} returned no thread id "
                     f"(payload keys: {sorted(result.keys())})"
                 ),
             )
         self._thread_id = thread_id
         logger.info(
-            "codex app-server thread started: id=%s profile=%s cwd=%s",
+            "codex app-server thread %s: id=%s profile=%s cwd=%s",
+            "resumed" if method == "thread/resume" else "started",
             self._thread_id[:8],
             self._permission_profile,
             self._cwd,
@@ -494,9 +506,14 @@ class CodexAppServerSession:
         try:
             self.ensure_started()
         except (CodexAppServerError, TimeoutError) as exc:
-            result.error = self._format_error_with_stderr(
-                "codex app-server startup failed", exc
-            )
+            prefix = "codex app-server startup failed"
+            if self._resume_thread_id:
+                prefix = (
+                    "saved Codex thread could not be resumed; its context "
+                    "was not discarded. Retry this message, or use /new "
+                    "only if you want to start a fresh conversation"
+                )
+            result.error = self._format_error_with_stderr(prefix, exc)
             # Subprocess almost certainly unhealthy — retire so the next
             # turn re-spawns cleanly.
             result.should_retire = True
@@ -805,9 +822,14 @@ class CodexAppServerSession:
         try:
             self.ensure_started()
         except (CodexAppServerError, TimeoutError) as exc:
-            result.error = self._format_error_with_stderr(
-                "codex app-server startup failed", exc
-            )
+            prefix = "codex app-server startup failed"
+            if self._resume_thread_id:
+                prefix = (
+                    "saved Codex thread could not be resumed; its context "
+                    "was not discarded. Retry this request, or use /new "
+                    "only if you want to start a fresh conversation"
+                )
+            result.error = self._format_error_with_stderr(prefix, exc)
             result.should_retire = True
             return result
 

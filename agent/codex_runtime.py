@@ -21,11 +21,150 @@ import logging
 import os
 import time
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
 logger = logging.getLogger(__name__)
+
+
+class CodexRuntimeBinding:
+    """Own the live Codex client and its Hermes/thread identity."""
+
+    def __init__(
+        self,
+        *,
+        client: Any = None,
+        owner_session_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> None:
+        self._client = client
+        self._owner_session_id = self._clean(owner_session_id)
+        self._thread_id = self._clean(thread_id)
+
+    @staticmethod
+    def _clean(value: Any) -> Optional[str]:
+        cleaned = str(value or "").strip()
+        return cleaned or None
+
+    @property
+    def client(self) -> Any:
+        return self._client
+
+    @client.setter
+    def client(self, value: Any) -> None:
+        self._client = value
+
+    @property
+    def owner_session_id(self) -> Optional[str]:
+        return self._owner_session_id
+
+    @owner_session_id.setter
+    def owner_session_id(self, value: Any) -> None:
+        self._owner_session_id = self._clean(value)
+
+    @property
+    def thread_id(self) -> Optional[str]:
+        return self._thread_id
+
+    @thread_id.setter
+    def thread_id(self, value: Any) -> None:
+        self._thread_id = self._clean(value)
+
+    def bind(self, session_id: Any) -> None:
+        session_id = self._clean(session_id)
+        if not session_id:
+            return
+        if self._owner_session_id and self._owner_session_id != session_id:
+            self.retire(preserve_thread=False)
+        self._owner_session_id = session_id
+
+    def resume_thread_id(self, session_id: Any) -> Optional[str]:
+        session_id = self._clean(session_id)
+        if self._owner_session_id and session_id != self._owner_session_id:
+            return None
+        return self._thread_id
+
+    def ensure_client(
+        self,
+        *,
+        session_id: Any,
+        factory: Callable[[Optional[str]], Any],
+        durable_thread_id: Any = None,
+    ) -> Any:
+        self.bind(session_id)
+        if self._client is None:
+            resume_thread_id = self._thread_id or self._clean(durable_thread_id)
+            self._client = factory(resume_thread_id)
+        return self._client
+
+    def record_thread(self, *, session_id: Any, thread_id: Any) -> bool:
+        session_id = self._clean(session_id)
+        thread_id = self._clean(thread_id)
+        if not session_id or not thread_id:
+            return False
+        if self._owner_session_id and self._owner_session_id != session_id:
+            logger.warning(
+                "Ignoring stale Codex thread binding (owner=%s session=%s thread=%s)",
+                self._owner_session_id,
+                session_id,
+                thread_id,
+            )
+            return False
+        self._owner_session_id = session_id
+        self._thread_id = thread_id
+        return True
+
+    def current_client_thread_id(self) -> Optional[str]:
+        return self._clean(getattr(self._client, "thread_id", None))
+
+    def run_turn(self, *, user_input: str) -> Any:
+        if self._client is None:
+            raise RuntimeError("Codex app-server client is not bound")
+        return self._client.run_turn(user_input=user_input)
+
+    def compact_thread(self) -> Any:
+        if self._client is None:
+            raise RuntimeError("Codex app-server client is not bound")
+        return self._client.compact_thread()
+
+    def request_interrupt(self) -> None:
+        callback = getattr(self._client, "request_interrupt", None)
+        if callable(callback):
+            callback()
+
+    def request_steer(self, text: str) -> bool:
+        callback = getattr(self._client, "request_steer", None)
+        return bool(callback(text)) if callable(callback) else False
+
+    def retire(self, *, preserve_thread: bool = True) -> None:
+        client = self._client
+        if client is not None and preserve_thread:
+            client_thread_id = self._clean(getattr(client, "thread_id", None))
+            if client_thread_id:
+                self._thread_id = client_thread_id
+        self._client = None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+        if not preserve_thread:
+            self._thread_id = None
+
+
+def get_codex_runtime_binding(agent: Any) -> CodexRuntimeBinding:
+    """Return an agent's binding, adopting legacy test-double attributes."""
+    binding = vars(agent).get("_codex_runtime_binding")
+    if isinstance(binding, CodexRuntimeBinding):
+        return binding
+    binding = CodexRuntimeBinding(
+        client=vars(agent).get("_codex_session"),
+        owner_session_id=vars(agent).get("_codex_session_owner_id"),
+        thread_id=vars(agent).get("_codex_resume_thread_id"),
+    )
+    setattr(agent, "_codex_runtime_binding", binding)
+    return binding
 
 
 def _codex_request_failure_details(error: BaseException) -> tuple[int | None, str]:
@@ -686,6 +825,48 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     return on_event
 
 
+def _persist_codex_thread_binding(
+    agent,
+    *,
+    session_id: str,
+    thread_id: str,
+) -> None:
+    """Bind one Hermes session to its Codex thread in memory and SQLite."""
+    session_id = str(session_id or "").strip()
+    thread_id = str(thread_id or "").strip()
+    if not session_id or not thread_id:
+        return
+
+    binding = get_codex_runtime_binding(agent)
+    if not binding.record_thread(session_id=session_id, thread_id=thread_id):
+        return
+    session_db = getattr(agent, "_session_db", None)
+    if session_db is None:
+        return
+    try:
+        ensure_session = getattr(agent, "_ensure_db_session", None)
+        if callable(ensure_session) and session_id == str(
+            getattr(agent, "session_id", "") or ""
+        ).strip():
+            ensure_session()
+        written = session_db.set_codex_thread_id(session_id, thread_id)
+        if written is False:
+            logger.warning(
+                "Codex app-server thread binding matched no session row "
+                "(session=%s thread=%s)",
+                session_id,
+                thread_id,
+            )
+    except Exception:
+        logger.warning(
+            "Codex app-server thread binding persist failed "
+            "(session=%s thread=%s)",
+            session_id,
+            thread_id,
+            exc_info=True,
+        )
+
+
 def run_codex_app_server_turn(
     agent,
     *,
@@ -721,10 +902,15 @@ def run_codex_app_server_turn(
         _ServerRequestRouting,
     )
 
+    turn_session_id = str(getattr(agent, "session_id", "") or "").strip()
+    binding = get_codex_runtime_binding(agent)
+    # A Codex thread is append-only and cannot cross a logical Hermes session.
+    binding.bind(turn_session_id)
+
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
     # shutdown (see _cleanup hook).
-    if not hasattr(agent, "_codex_session") or agent._codex_session is None:
+    if binding.client is None:
         from agent.runtime_cwd import resolve_agent_cwd
 
         cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
@@ -765,14 +951,39 @@ def run_codex_app_server_turn(
         # users see no live tool-progress or interim commentary while
         # codex_app_server is running — only the final answer (#33200).
         # Supersedes the narrower item/started-only bridge from #38835.
-        agent._codex_session = CodexAppServerSession(
-            cwd=cwd,
-            approval_callback=approval_callback,
-            request_routing=_ServerRequestRouting(
-                auto_approve_exec=auto_approve_requests,
-                auto_approve_apply_patch=auto_approve_requests,
-            ),
-            on_event=make_codex_app_server_event_bridge(agent),
+        durable_thread_id = None
+        if (
+            binding.resume_thread_id(turn_session_id) is None
+            and agent._session_db
+            and agent.session_id
+        ):
+            try:
+                durable_thread_id = agent._session_db.get_codex_thread_id(
+                    agent.session_id
+                )
+            except Exception:
+                logger.warning(
+                    "Codex app-server thread binding read failed (session=%s)",
+                    agent.session_id,
+                    exc_info=True,
+                )
+
+        def create_client(resume_thread_id: Optional[str]) -> Any:
+            return CodexAppServerSession(
+                cwd=cwd,
+                approval_callback=approval_callback,
+                request_routing=_ServerRequestRouting(
+                    auto_approve_exec=auto_approve_requests,
+                    auto_approve_apply_patch=auto_approve_requests,
+                ),
+                on_event=make_codex_app_server_event_bridge(agent),
+                resume_thread_id=resume_thread_id,
+            )
+
+        binding.ensure_client(
+            session_id=turn_session_id,
+            factory=create_client,
+            durable_thread_id=durable_thread_id,
         )
 
     # NOTE: the user message is ALREADY appended to messages by the
@@ -780,16 +991,18 @@ def run_codex_app_server_turn(
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        turn = binding.run_turn(user_input=user_message)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
-        # Crash → unconditionally drop the session so the next turn
-        # respawns from scratch instead of reusing a dead client.
-        try:
-            agent._codex_session.close()
-        except Exception:
-            pass
-        agent._codex_session = None
+        known_thread_id = binding.current_client_thread_id()
+        if known_thread_id:
+            _persist_codex_thread_binding(
+                agent,
+                session_id=turn_session_id,
+                thread_id=known_thread_id,
+            )
+        # Crash → drop the dead client but preserve its resumable thread.
+        binding.retire(preserve_thread=True)
         _user_interrupted = bool(
             getattr(agent, "_interrupt_requested", False)
         )
@@ -830,6 +1043,15 @@ def run_codex_app_server_turn(
     if _user_interrupted:
         agent.clear_interrupt()
 
+    # Persist before retirement closes the subprocess so a replacement can
+    # resume the exact Codex context.
+    if turn.thread_id:
+        _persist_codex_thread_binding(
+            agent,
+            session_id=turn_session_id,
+            thread_id=turn.thread_id,
+        )
+
     # If the turn signalled the underlying client is wedged (deadline
     # blown, post-tool watchdog tripped, OAuth refresh died, subprocess
     # exited), retire the session so the next turn respawns codex
@@ -840,11 +1062,7 @@ def run_codex_app_server_turn(
             "codex app-server session retired (turn error: %s)",
             turn.error,
         )
-        try:
-            agent._codex_session.close()
-        except Exception:
-            pass
-        agent._codex_session = None
+        binding.retire(preserve_thread=True)
 
     # Splice projected messages into the conversation. The projector emits
     # standard {role, content, tool_calls, tool_call_id} entries, which
