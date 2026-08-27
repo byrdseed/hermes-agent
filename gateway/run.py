@@ -4150,6 +4150,23 @@ def _normalize_empty_agent_response(
     return response
 
 
+def _normalize_partial_agent_response(agent_result: dict, response: str) -> str:
+    """Replace a misleading partial final with an explicit terminal notice."""
+    if (
+        not response
+        or classify_agent_turn_outcome(agent_result) is not AgentTurnOutcome.INCOMPLETE
+        or _is_gateway_hidden_reasoning_incomplete_turn(agent_result)
+    ):
+        return response
+
+    error_detail = str(agent_result.get("error") or "processing incomplete").strip()
+    return (
+        "⚠️ This run stopped unexpectedly after partial output and is no "
+        "longer working. "
+        f"{error_detail[:200]}. Please retry the task."
+    )
+
+
 def _is_gateway_hidden_reasoning_incomplete_turn(agent_result: dict) -> bool:
     """Detect retry-exhausted turns with hidden reasoning but no visible answer.
 
@@ -6390,6 +6407,7 @@ class TurnRunner:
             ctx.message = (
                 "[System note: A new message has arrived. The conversation "
                 "history contains pending tool outputs from an interrupted turn. "
+                "The prior run ended and is NOT still working. "
                 "IGNORE those pending results. Address the user's NEW message "
                 "below FIRST. Do NOT re-execute old tool calls from the history.]\n\n"
                 + ctx.message
@@ -20927,6 +20945,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # empty-response handling (and the suppression below) applies.
             if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
                 response = ""
+            elif turn_outcome is AgentTurnOutcome.INCOMPLETE:
+                response = _normalize_partial_agent_response(agent_result, response)
             try:
                 from gateway.response_filters import is_intentional_silence_agent_result
                 _intentional_silence = is_intentional_silence_agent_result(
