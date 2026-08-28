@@ -94,6 +94,18 @@ def test_compaction_completion_notice_respects_progress_notices_gate(
         assert result is None
 
 
+@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
+@pytest.mark.parametrize("message", [
+    "Compression coming soon!",
+    "Pause! We are compressing at 3:42 PM HST",
+])
+def test_new_lifecycle_notices_respect_progress_gate(monkeypatch, platform, message):
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    assert _prepare_gateway_status_message(platform, "lifecycle", message) is None
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {"compression": {"progress_notices": True}})
+    assert _prepare_gateway_status_message(platform, "lifecycle", message) == message
+
+
 def test_enabled_gate_does_not_leak_to_raw_platforms(progress_notices_enabled):
     """Programmatic surfaces keep raw text regardless of the gate."""
     message = ROUTINE_COMPRESSION_STATUS_SAMPLES[0]

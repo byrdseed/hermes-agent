@@ -1,10 +1,16 @@
 import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 
 from agent.codex_runtime import _record_codex_app_server_compaction
-from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS, compress_context
+from agent.conversation_compression import (
+    COMPACTION_DONE_STATUS,
+    COMPACTION_STATUS,
+    automatic_compression_pause_status,
+    compress_context,
+)
 from agent.transports.codex_app_server_session import TurnResult
 
 
@@ -56,6 +62,7 @@ class DummyAgent:
         self._cached_system_prompt = "cached prompt"
         self._codex_session = FakeCodexSession(result)
         self.context_compressor = SimpleNamespace(
+            threshold_tokens=100000,
             compression_count=0,
             last_compression_rough_tokens=0,
             last_prompt_tokens=123,
@@ -136,6 +143,9 @@ def test_codex_app_server_hermes_auto_mode_compacts_the_live_thread():
     assert prompt == "cached prompt"
     assert agent._codex_session.calls == 1
     assert agent.context_compressor.compression_count == 1
+    assert agent.context_compressor._compression_coming_soon_emitted is False
+    assert agent.statuses[0] == "Compression coming soon!"
+    assert agent.statuses[1].startswith("Pause! We are compressing at ")
     assert agent.events == [
         (
             "session:compress",
@@ -151,6 +161,13 @@ def test_codex_app_server_hermes_auto_mode_compacts_the_live_thread():
             },
         )
     ]
+
+
+def test_automatic_pause_uses_hawaii_local_time():
+    now = datetime(2026, 8, 28, 1, 42, tzinfo=timezone.utc)
+    assert automatic_compression_pause_status(now) == (
+        "Pause! We are compressing at 3:42 PM HST"
+    )
 
 
 def test_codex_app_server_compaction_heartbeat_refreshes_activity_while_waiting():

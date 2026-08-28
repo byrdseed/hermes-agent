@@ -32,11 +32,10 @@ from agent.conversation_compression import (
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
-    PRE_API_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
+    maybe_emit_compression_coming_soon,
 )
-from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
@@ -2706,25 +2705,6 @@ def run_conversation(
                 compression_attempts,
                 max_compression_attempts,
             )
-            _pre_api_status = automatic_compaction_status_message(
-                _compressor,
-                phase="pre_api",
-                default_message=PRE_API_COMPRESSION_STATUS_TEMPLATE.format(
-                    tokens=request_pressure_tokens
-                ),
-                approx_tokens=request_pressure_tokens,
-                threshold_tokens=int(
-                    getattr(_compressor, "threshold_tokens", 0) or 0
-                ),
-                context_length=int(
-                    getattr(_compressor, "context_length", 0) or 0
-                ),
-                model=agent.model,
-                attempt=compression_attempts,
-                max_attempts=max_compression_attempts,
-            )
-            if _pre_api_status:
-                agent._emit_status(_pre_api_status)
             _last_preflight_pressure = request_pressure_tokens
             _pre_api_input = messages
             messages, active_system_prompt = agent._compress_context(
@@ -4186,6 +4166,9 @@ def run_conversation(
                     _compression_threshold = int(
                         getattr(agent.context_compressor, "threshold_tokens", 0)
                         or 0
+                    )
+                    maybe_emit_compression_coming_soon(
+                        agent, prompt_tokens, _compression_threshold
                     )
                     if _should_rearm_compression_budget(
                         compression_attempts,

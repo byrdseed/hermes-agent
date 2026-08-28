@@ -62,7 +62,7 @@ import tempfile
 import time
 import uuid
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -103,6 +103,34 @@ COMPACTION_STATUS = (
 )
 
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
+COMPRESSION_COMING_SOON_STATUS = "Compression coming soon!"
+
+
+def automatic_compression_pause_status(now: Optional[datetime] = None) -> str:
+    hst = timezone(timedelta(hours=-10), "HST")
+    current = (now or datetime.now(timezone.utc)).astimezone(hst)
+    hour = current.hour % 12 or 12
+    return f"Pause! We are compressing at {hour}:{current:%M %p} HST"
+
+
+def maybe_emit_compression_coming_soon(
+    agent: Any, prompt_tokens: int, threshold_tokens: int, *, starting: bool = False
+) -> None:
+    engine = agent.context_compressor
+    threshold = int(threshold_tokens or 0)
+    in_band = threshold > 0 and threshold * 0.9 <= prompt_tokens < threshold
+    if getattr(agent, "compression_enabled", True) is False:
+        return
+    if threshold <= 0 or getattr(
+        engine, "_compression_coming_soon_emitted", False
+    ) or not (in_band or starting and prompt_tokens >= threshold):
+        return
+    if automatic_compaction_status_message(
+        engine, phase="compress", default_message=COMPRESSION_COMING_SOON_STATUS
+    ) is None:
+        return
+    agent._emit_status(COMPRESSION_COMING_SOON_STATUS)
+    engine._compression_coming_soon_emitted = True
 
 
 def _strip_marker_for_comparison(msgs: Any) -> Any:
@@ -2481,10 +2509,14 @@ def compress_context(
     )
     _compaction_status = COMPACTION_STATUS
     if not force:
+        maybe_emit_compression_coming_soon(
+            agent, int(approx_tokens or 0), agent.context_compressor.threshold_tokens,
+            starting=True,
+        )
         _compaction_status = automatic_compaction_status_message(
             agent.context_compressor,
             phase="compress",
-            default_message=_compaction_status,
+            default_message=automatic_compression_pause_status(),
             approx_tokens=approx_tokens,
             message_count=_pre_msg_count,
             model=agent.model,
@@ -4111,6 +4143,8 @@ def compress_context(
             f"{_compressed_est:,}",
         )
         _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
+        if _commit_status == "committed":
+            agent.context_compressor._compression_coming_soon_emitted = False
         _emit_compression_attempt_telemetry(
             agent,
             started_at=_attempt_started_at,
@@ -4194,7 +4228,14 @@ def _compress_context_via_codex_app_server(
         f"{approx_tokens:,}" if approx_tokens else "unknown",
     )
     try:
-        agent._emit_status(COMPACTION_STATUS)
+        if not force:
+            maybe_emit_compression_coming_soon(
+                agent, int(approx_tokens or 0), agent.context_compressor.threshold_tokens,
+                starting=True,
+            )
+        agent._emit_status(
+            COMPACTION_STATUS if force else automatic_compression_pause_status()
+        )
     except Exception:
         pass
 
@@ -4264,6 +4305,7 @@ def _compress_context_via_codex_app_server(
     existing_prompt = getattr(agent, "_cached_system_prompt", None)
     if not existing_prompt:
         existing_prompt = agent._build_system_prompt(system_message)
+    agent.context_compressor._compression_coming_soon_emitted = False
     # Terminal edge only on success — failure/interrupt paths above return
     # without it, matching the main compress_context() gating.
     _emit_compaction_done(agent)

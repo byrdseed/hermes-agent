@@ -484,10 +484,12 @@ class TestPreflightCompression:
         assert new_system_prompt == "You are helpful."
         build_prompt.assert_not_called()
         assert events == [
-            ("lifecycle", COMPACTION_STATUS),
+            ("lifecycle", events[0][1]),
             ("compress", "started"),
             ("compacted", COMPACTION_DONE_STATUS),
         ]
+        assert events[0][1].startswith("Pause! We are compressing at ")
+        assert agent.context_compressor._compression_coming_soon_emitted is False
 
     def test_compress_context_emits_one_terminal_status_when_lock_is_unavailable(self, agent):
         """A rejected lock must retire the started desktop compaction phase."""
@@ -692,7 +694,7 @@ class TestPreflightCompression:
         )
         assert result["completed"] is True
         assert result["final_response"] == "After preflight"
-        assert any(
+        assert not any(
             ev == "lifecycle" and "Preflight compression" in msg
             for ev, msg in status_messages
         )
@@ -741,8 +743,8 @@ class TestPreflightCompression:
             for ev, msg in status_messages
         )
 
-    def test_preflight_uses_context_engine_custom_status_message(self, agent):
-        """Plugin engines can replace generic built-in-compressor wording."""
+    def test_preflight_defers_custom_status_to_compression_entry(self, agent):
+        """Preflight emits no start chatter before the real compression entry."""
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 100_000
@@ -788,7 +790,7 @@ class TestPreflightCompression:
         mock_compress.assert_called_once()
         assert result["completed"] is True
         lifecycle_messages = [msg for ev, msg in status_messages if ev == "lifecycle"]
-        assert "🔧 LCM context maintenance: preparing compacted context." in lifecycle_messages
+        assert "🔧 LCM context maintenance: preparing compacted context." not in lifecycle_messages
         assert not any("Preflight compression" in msg for msg in lifecycle_messages)
 
 
