@@ -52,6 +52,7 @@ from agent.async_utils import consume_detached_task_result, safe_schedule_thread
 from agent.conversation_compression import (
     COMPACTION_DONE_STATUS,
     COMPACTION_STATUS,
+    COMPRESSION_COMING_SOON_STATUS,
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
@@ -131,6 +132,8 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|auto-lowered\s+(?:this\s+)?session'?s?\s+threshold"
     r"|configured\s+auxiliary\s+compression\s+provider\s+.+\s+unavailable"
     r"|skipping\s+concurrent\s+compression"
+    r"|compression\s+coming\s+soon!"
+    r"|pause!\s+we\s+are\s+compressing\s+at\s+\d{1,2}:\d{2}\s+[ap]m\s+hst"
     r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
     r"|resumed\s+after\s+\d+s\s+idle\s+[—-]\s+compacting"
     r"|preflight\s+compression"
@@ -350,6 +353,7 @@ _COMPRESSION_PROGRESS_STATUS_RE = re.compile(
         for _template in (
             COMPACTION_STATUS,
             COMPACTION_DONE_STATUS,
+            COMPRESSION_COMING_SOON_STATUS,
             PRE_API_COMPRESSION_STATUS_TEMPLATE,
             PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
             IDLE_COMPACTION_STATUS_TEMPLATE,
@@ -358,7 +362,7 @@ _COMPRESSION_PROGRESS_STATUS_RE = re.compile(
             COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
             COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
         )
-    ),
+    ) + r"|Pause!\ We\ are\ compressing\ at\ \d{1,2}:\d{2}\ [AP]M\ HST",
     re.IGNORECASE,
 )
 

@@ -407,6 +407,7 @@ class ContextEngine(ABC):
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
         self.compression_count = 0
+        self._compression_coming_soon_emitted = False
 
     # -- Optional: tools ---------------------------------------------------
 

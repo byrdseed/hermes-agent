@@ -189,3 +189,31 @@ def test_builtin_compressor_default_sub_threshold_path_unchanged(tmp_path):
     agent._compress_context.assert_not_called()
     agent._emit_status.assert_not_called()
     assert ctx.preflight_compression_blocked is False
+
+
+def test_automatic_compression_warning_band_is_once_and_suppressible():
+    from agent.conversation_compression import maybe_emit_compression_coming_soon
+
+    statuses = []
+    engine = types.SimpleNamespace(emit_automatic_compaction_status=True)
+    agent = types.SimpleNamespace(
+        context_compressor=engine, _emit_status=statuses.append
+    )
+    maybe_emit_compression_coming_soon(agent, 899, 1000)
+    maybe_emit_compression_coming_soon(agent, 899, 1000, starting=True)
+    maybe_emit_compression_coming_soon(agent, 900, 1000)
+    maybe_emit_compression_coming_soon(agent, 950, 1000)
+    assert statuses == ["Compression coming soon!"]
+
+    agent.compression_enabled = False
+    engine._compression_coming_soon_emitted = False
+    statuses.clear()
+    maybe_emit_compression_coming_soon(agent, 900, 1000)
+    assert statuses == []
+
+    agent.compression_enabled = True
+    engine.emit_automatic_compaction_status = False
+    engine._compression_coming_soon_emitted = False
+    statuses.clear()
+    maybe_emit_compression_coming_soon(agent, 900, 1000)
+    assert statuses == []

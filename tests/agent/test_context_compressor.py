@@ -3509,12 +3509,14 @@ class TestPreLlmFeasibilityCheck:
         """_prellm_skip_count must reset alongside _ineffective_compression_count."""
         compressor._prellm_skip_count = 5
         compressor._ineffective_compression_count = 2
+        compressor._compression_coming_soon_emitted = True
 
         # on_session_reset() resets all per-session counters
         compressor.on_session_reset()
 
         assert compressor._prellm_skip_count == 0
         assert compressor._ineffective_compression_count == 0
+        assert compressor._compression_coming_soon_emitted is False
 
     def test_skip_count_resets_on_bind_session_state(self, compressor):
         """Rebinding to a session row must clear the per-session skip counter

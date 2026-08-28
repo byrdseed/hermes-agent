@@ -32,13 +32,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
 from agent.conversation_compression import (
-    IDLE_COMPACTION_STATUS_TEMPLATE,
-    PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
     recover_rotated_compression_session,
 )
-from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
@@ -862,18 +859,6 @@ def build_turn_context(
                     f"{_idle_floor:,}",
                     agent.session_id or "none",
                 )
-                _idle_status = automatic_compaction_status_message(
-                    _compressor,
-                    phase="idle",
-                    default_message=IDLE_COMPACTION_STATUS_TEMPLATE.format(
-                        idle_seconds=int(_idle_gap), tokens=_idle_tokens
-                    ),
-                    approx_tokens=_idle_tokens,
-                    idle_seconds=int(_idle_gap),
-                    model=agent.model,
-                )
-                if _idle_status:
-                    agent._emit_status(_idle_status)
                 _idle_input = messages
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_idle_tokens,
@@ -1029,20 +1014,6 @@ def build_turn_context(
                 agent.model,
                 f"{_compressor.context_length:,}",
             )
-            _preflight_status = automatic_compaction_status_message(
-                _compressor,
-                phase="preflight",
-                default_message=PREFLIGHT_COMPRESSION_STATUS_TEMPLATE.format(
-                    tokens=_preflight_tokens,
-                    threshold=_compressor.threshold_tokens,
-                ),
-                approx_tokens=_preflight_tokens,
-                threshold_tokens=_compressor.threshold_tokens,
-                context_length=_compressor.context_length,
-                model=agent.model,
-            )
-            if _preflight_status:
-                agent._emit_status(_preflight_status)
             # Preflight passes honor the same configured per-turn cap
             # (compression.max_attempts) as the loop's compression sites;
             # default 3 preserves the prior hardcoded behavior.
