@@ -96,7 +96,7 @@ def test_compaction_completion_notice_respects_progress_notices_gate(
 
 @pytest.mark.parametrize("platform", CHAT_PLATFORMS)
 @pytest.mark.parametrize("message", [
-    "Compression coming soon!",
+    ":mega: Compression coming soon!",
     "Pause! We are compressing at 3:42 PM HST",
 ])
 def test_new_lifecycle_notices_respect_progress_gate(monkeypatch, platform, message):
