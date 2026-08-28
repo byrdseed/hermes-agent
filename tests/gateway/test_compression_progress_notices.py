@@ -18,6 +18,8 @@ import pytest
 import gateway.run as gateway_run
 from agent.conversation_compression import (
     COMPACTION_DONE_STATUS,
+    COMPRESSION_COMING_SOON_STATUS,
+    COMPRESSION_PAUSE_STATUS_SAMPLE,
     ROUTINE_COMPRESSION_STATUS_SAMPLES,
 )
 from gateway.run import _prepare_gateway_status_message
@@ -78,18 +80,22 @@ def test_enabled_still_suppresses_non_compression_noise(
 
 @pytest.mark.parametrize("enabled", [True, False], ids=["enabled", "default"])
 @pytest.mark.parametrize("platform", CHAT_PLATFORMS)
+@pytest.mark.parametrize(
+    "message",
+    [COMPACTION_DONE_STATUS, COMPRESSION_COMING_SOON_STATUS, COMPRESSION_PAUSE_STATUS_SAMPLE],
+)
 def test_compaction_completion_notice_respects_progress_notices_gate(
-    monkeypatch, platform, enabled
+    monkeypatch, platform, enabled, message
 ):
-    """The completion edge follows the same opt-in gate as the start edge."""
+    """Routine start/done/warning statuses share the opt-in chat gate."""
     monkeypatch.setattr(
         gateway_run,
         "_load_gateway_config",
         lambda: {"compression": {"progress_notices": enabled}},
     )
-    result = _prepare_gateway_status_message(platform, "compacted", COMPACTION_DONE_STATUS)
+    result = _prepare_gateway_status_message(platform, "lifecycle", message)
     if enabled:
-        assert result == COMPACTION_DONE_STATUS
+        assert result == message
     else:
         assert result is None
 

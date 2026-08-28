@@ -62,7 +62,7 @@ import tempfile
 import time
 import uuid
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -191,6 +191,66 @@ CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE = (
 # Sample-formatted instances of every routine compression status line, for
 # behavioral tests that iterate the ACTUAL emitted wording (formatted from the
 # same constants the emission sites use) through the gateway noise filter.
+COMPRESSION_COMING_SOON_STATUS = "Compression coming soon!"
+COMPRESSION_PAUSE_STATUS_SAMPLE = "Pause! We are compressing at 3:42 PM HST"
+
+
+def format_compression_pause_status(now: datetime | None = None) -> str:
+    current = (now or datetime.now(timezone.utc)).astimezone(
+        timezone(timedelta(hours=-10), name="HST")
+    )
+    return (
+        f"Pause! We are compressing at {current.hour % 12 or 12}:"
+        f"{current.minute:02d} {'AM' if current.hour < 12 else 'PM'} HST"
+    )
+
+
+def consider_compression_coming_soon(
+    agent: Any, tokens: int, *, threshold_tokens: int | None = None, compressing: bool = False,
+) -> None:
+    try:
+        engine = getattr(agent, "context_compressor", None)
+        threshold = int(
+            threshold_tokens if threshold_tokens is not None
+            else (getattr(engine, "threshold_tokens", 0) or 0)
+        )
+        usage = int(tokens or 0)
+        if (
+            (not compressing and not getattr(agent, "compression_enabled", True))
+            or threshold <= 0
+            or getattr(engine, "_compression_coming_soon_latched", False)
+            or (not compressing and not (usage >= int(threshold * 0.90) and usage < threshold))
+        ):
+            return
+        message = automatic_compaction_status_message(
+            engine, phase="coming_soon", default_message=COMPRESSION_COMING_SOON_STATUS,
+        )
+        if not message:
+            return
+        if engine is not None:
+            engine._compression_coming_soon_latched = True
+        emit = getattr(agent, "_emit_status", None)
+        if callable(emit):
+            emit(message)
+    except Exception:
+        logger.debug("compression coming-soon notice failed", exc_info=True)
+
+
+def emit_automatic_compression_notices(agent: Any, tokens: int = 0, **context: Any) -> str | None:
+    try:
+        consider_compression_coming_soon(agent, tokens, compressing=True)
+        message = automatic_compaction_status_message(
+            getattr(agent, "context_compressor", None), phase="compress",
+            default_message=format_compression_pause_status(), approx_tokens=tokens, **context,
+        )
+        if message and callable(getattr(agent, "_emit_status", None)):
+            agent._emit_status(message)
+        return message
+    except Exception:
+        logger.debug("automatic compression notice failed", exc_info=True)
+        return None
+
+
 ROUTINE_COMPRESSION_STATUS_SAMPLES = (
     COMPACTION_STATUS,
     COMPACTION_DONE_STATUS,
@@ -203,6 +263,8 @@ ROUTINE_COMPRESSION_STATUS_SAMPLES = (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE.format(
         new_ctx=120000, old_ctx=250000
     ),
+    COMPRESSION_COMING_SOON_STATUS,
+    COMPRESSION_PAUSE_STATUS_SAMPLE,
 )
 
 
@@ -2481,17 +2543,15 @@ def compress_context(
     )
     _compaction_status = COMPACTION_STATUS
     if not force:
-        _compaction_status = automatic_compaction_status_message(
-            agent.context_compressor,
-            phase="compress",
-            default_message=_compaction_status,
-            approx_tokens=approx_tokens,
+        _compaction_status = emit_automatic_compression_notices(
+            agent,
+            approx_tokens or 0,
             message_count=_pre_msg_count,
             model=agent.model,
             focus_topic=focus_topic,
         )
     _compaction_status_emitted = bool(_compaction_status)
-    if _compaction_status:
+    if force and _compaction_status:
         agent._emit_status(_compaction_status)
     _compaction_done_emitted = False
     # Commit outcome of this attempt; rebound to "committed" on the success
@@ -4193,10 +4253,13 @@ def _compress_context_via_codex_app_server(
         len(messages),
         f"{approx_tokens:,}" if approx_tokens else "unknown",
     )
-    try:
-        agent._emit_status(COMPACTION_STATUS)
-    except Exception:
-        pass
+    if force:
+        try:
+            agent._emit_status(COMPACTION_STATUS)
+        except Exception:
+            pass
+    else:
+        emit_automatic_compression_notices(agent, approx_tokens or 0)
 
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     try:

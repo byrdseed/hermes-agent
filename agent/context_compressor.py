@@ -2405,6 +2405,7 @@ class ContextCompressor(ContextEngine):
         self._active_compression_telemetry = None
         self._compression_telemetry_seed = None
         self._proactive_prune_rearm_tokens = 0
+        self._compression_coming_soon_latched = False
 
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """Bind the current session row so durable cooldowns can round-trip."""
@@ -2667,6 +2668,7 @@ class ContextCompressor(ContextEngine):
         # usual bookkeeping.
         self._structural_no_op_backoff_until = 0.0
         self._verify_compaction_cleared_threshold = True
+        self._compression_coming_soon_latched = False
         if feasibility_skip:
             # A deliberate pre-LLM feasibility skip (#60451) is not a
             # summary-quality verdict: it must neither extend a fallback

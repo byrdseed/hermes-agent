@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 
 
 from agent.context_compressor import SUMMARY_PREFIX
-from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS
+from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS, COMPRESSION_COMING_SOON_STATUS
 from run_agent import AIAgent
 import run_agent
 
@@ -483,8 +483,11 @@ class TestPreflightCompression:
         ]
         assert new_system_prompt == "You are helpful."
         build_prompt.assert_not_called()
-        assert events == [
-            ("lifecycle", COMPACTION_STATUS),
+        assert events[0] == ("lifecycle", COMPRESSION_COMING_SOON_STATUS)
+        assert events[1][0] == "lifecycle"
+        assert events[1][1].startswith("Pause! We are compressing at ")
+        assert events[1][1].endswith(" HST")
+        assert events[2:] == [
             ("compress", "started"),
             ("compacted", COMPACTION_DONE_STATUS),
         ]

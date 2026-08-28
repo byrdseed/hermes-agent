@@ -34,6 +34,7 @@ from agent.conversation_compression import (
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
+    consider_compression_coming_soon,
     conversation_history_after_compression,
 )
 from agent.context_engine import automatic_compaction_status_message
@@ -2639,6 +2640,11 @@ def run_conversation(
         _compressor = agent.context_compressor
         _preflight_threshold = int(
             getattr(_compressor, "threshold_tokens", 0) or 0
+        )
+        consider_compression_coming_soon(
+            agent,
+            request_pressure_tokens,
+            threshold_tokens=_preflight_threshold,
         )
         # A previous mid-turn preflight pass deliberately continued the loop so
         # API-only context and all sanitization could be rebuilt. Compare that
