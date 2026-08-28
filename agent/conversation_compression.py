@@ -103,7 +103,7 @@ COMPACTION_STATUS = (
 )
 
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
-COMPRESSION_COMING_SOON_STATUS = "Compression coming soon!"
+COMPRESSION_COMING_SOON_STATUS = ":mega: Compression coming soon!"
 
 
 def automatic_compression_pause_status(now: Optional[datetime] = None) -> str:

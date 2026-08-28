@@ -144,7 +144,7 @@ def test_codex_app_server_hermes_auto_mode_compacts_the_live_thread():
     assert agent._codex_session.calls == 1
     assert agent.context_compressor.compression_count == 1
     assert agent.context_compressor._compression_coming_soon_emitted is False
-    assert agent.statuses[0] == "Compression coming soon!"
+    assert agent.statuses[0] == ":mega: Compression coming soon!"
     assert agent.statuses[1].startswith("Pause! We are compressing at ")
     assert agent.events == [
         (

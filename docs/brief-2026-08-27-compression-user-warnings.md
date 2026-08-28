@@ -10,7 +10,7 @@ The compression lifecycle already emits routine start/done statuses, and `compre
 
 Ian’s required chat contract is:
 
-1. Before automatic compression is required, send exactly: `Compression coming soon!`
+1. Before automatic compression is required, send exactly: `:mega: Compression coming soon!`
 2. At the moment automatic compression begins, send: `Pause! We are compressing at {time}`
 
 For Ian’s Slack surface, `{time}` must be the current Hawaii time rendered like `3:42 PM HST` (12-hour clock, no leading zero).
@@ -29,11 +29,11 @@ Reuse the existing status callback and `compression.progress_notices` gate. Do n
 
 ### Advance warning
 
-- For automatic compression only, emit `Compression coming soon!` once when the best available request/prompt usage first enters the warning band: at least 90% of `threshold_tokens`, but still below `threshold_tokens`.
+- For automatic compression only, emit `:mega: Compression coming soon!` once when the best available request/prompt usage first enters the warning band: at least 90% of `threshold_tokens`, but still below `threshold_tokens`.
 - The warning must be emitted early enough that it can reach the chat before the synchronous compression call begins.
 - Emit it at most once per compression cycle. Repeated tool/API turns within the band must not repeat it.
 - Reset the latch after a successful compression boundary and on a real session reset.
-- If one turn jumps from below the warning band directly to compression, emit `Compression coming soon!` immediately before the pause status, preserving that order. Do not skip the warning merely because the band was crossed in one jump.
+- If one turn jumps from below the warning band directly to compression, emit `:mega: Compression coming soon!` immediately before the pause status, preserving that order. Do not skip the warning merely because the band was crossed in one jump.
 - Do not warn when automatic compression is disabled, the engine has no usable threshold, or compression progress notices are disabled for chat delivery.
 
 ### Compression start
@@ -55,7 +55,7 @@ Reuse the existing status callback and `compression.progress_notices` gate. Do n
 Use strict TDD: write each focused test first and show it failing for the missing behavior before production changes.
 
 1. At 89.9% of the compression threshold, no advance warning is emitted.
-2. On first entry at 90%–99.9%, exactly `Compression coming soon!` is emitted once.
+2. On first entry at 90%–99.9%, exactly `:mega: Compression coming soon!` is emitted once.
 3. Additional turns in the warning band do not repeat it.
 4. Successful compression resets the latch so a later cycle can warn once again.
 5. Session reset clears the latch.

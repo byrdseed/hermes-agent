@@ -203,7 +203,7 @@ def test_automatic_compression_warning_band_is_once_and_suppressible():
     maybe_emit_compression_coming_soon(agent, 899, 1000, starting=True)
     maybe_emit_compression_coming_soon(agent, 900, 1000)
     maybe_emit_compression_coming_soon(agent, 950, 1000)
-    assert statuses == ["Compression coming soon!"]
+    assert statuses == [":mega: Compression coming soon!"]
 
     agent.compression_enabled = False
     engine._compression_coming_soon_emitted = False
