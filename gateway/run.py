@@ -3621,6 +3621,40 @@ def _parse_session_key(session_key: str) -> "dict | None":
     return None
 
 
+def _strip_session_key_suffix(value: str, token: str) -> str:
+    if not token or not value:
+        return value
+    suffix = f":{token}"
+    if value.endswith(suffix) and len(value) > len(suffix):
+        return value[:-len(suffix)]
+    return value
+
+
+def _chat_id_from_session_key(session_key: str, source: SessionSource) -> Optional[str]:
+    platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+    chat_type = str(source.chat_type or "")
+    if not session_key or not platform or not chat_type:
+        return None
+    marker = f":{platform}:{chat_type}:"
+    idx = session_key.find(marker)
+    if idx < 0:
+        return None
+    rest = session_key[idx + len(marker):]
+    if platform == Platform.SLACK.value and source.scope_id:
+        scope_prefix = f"{source.scope_id}:"
+        if rest.startswith(scope_prefix):
+            rest = rest[len(scope_prefix):]
+    user_id = str(source.user_id or "").strip()
+    thread_id = str(source.thread_id or "").strip()
+    if source.chat_type == "dm":
+        rest = _strip_session_key_suffix(rest, thread_id)
+        rest = _strip_session_key_suffix(rest, user_id)
+    else:
+        rest = _strip_session_key_suffix(rest, user_id)
+        rest = _strip_session_key_suffix(rest, thread_id)
+    return rest or None
+
+
 def _shorten_command_for_display(command: str, limit: int = 80) -> str:
     """Collapse a shell command onto one line and cap its length for display."""
     one_line = " ".join((command or "").split())
@@ -24414,7 +24448,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "the connector's tenant guard (user_id fallback only).",
                 platform_name, chat_id, chat_type,
             )
-        return SessionSource(
+        source = SessionSource(
             platform=platform,
             chat_id=chat_id,
             chat_type=chat_type,
@@ -24423,6 +24457,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name=str(evt.get("user_name") or "").strip() or None,
             scope_id=scope_id,
         )
+        if session_key.startswith("agent:"):
+            return self._align_process_event_source(source, session_key)
+        return source
+
+    def _process_event_source_key(self, source: SessionSource) -> str:
+        config = getattr(self, "config", None)
+        return build_session_key(
+            source,
+            group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
+            thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
+            profile=source.profile,
+        )
+
+    def _align_process_event_source(self, source: SessionSource, session_key: str) -> SessionSource:
+        # The generic parser is intentionally lossy on extra colon slots. Use the
+        # durable session_key as identity and keep only a repair that round-trips.
+        if self._process_event_source_key(source) == session_key:
+            return source
+        recovered = _chat_id_from_session_key(session_key, source)
+        if not recovered or recovered == source.chat_id:
+            return source
+        repaired = dataclasses.replace(source, chat_id=recovered)
+        if self._process_event_source_key(repaired) == session_key:
+            return repaired
+        return source
 
     async def _drain_watch_notifications(self, completion_queue) -> None:
         """Consume queued watch events and inject them when notifications are enabled.
