@@ -3622,7 +3622,6 @@ def _parse_session_key(session_key: str) -> "dict | None":
 
 
 def _strip_session_key_suffix(value: str, token: str) -> str:
-    """Remove a trailing ``:{token}`` slot when *value* still has a chat_id in front of it."""
     if not token or not value:
         return value
     suffix = f":{token}"
@@ -3632,12 +3631,6 @@ def _strip_session_key_suffix(value: str, token: str) -> str:
 
 
 def _chat_id_from_session_key(session_key: str, source: SessionSource) -> Optional[str]:
-    """Recover chat_id from a durable ``agent:`` key when colon-split truncated it.
-
-    Prefix is ``:{platform}:{chat_type}:``. Slack ``scope_id`` is skipped when present
-    on *source*. The user and thread slots already on *source* are stripped from the
-    right in the same order ``build_session_key`` appends them.
-    """
     platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
     chat_type = str(source.chat_type or "")
     if not session_key or not platform or not chat_type:
@@ -24469,7 +24462,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return source
 
     def _process_event_source_key(self, source: SessionSource) -> str:
-        """Session key for a reconstructed process-event source, using runner isolation flags."""
         config = getattr(self, "config", None)
         return build_session_key(
             source,
@@ -24479,13 +24471,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
     def _align_process_event_source(self, source: SessionSource, session_key: str) -> SessionSource:
-        """Restore a colon-bearing chat_id when fallback reconstruction does not round-trip.
-
-        ``_parse_session_key`` takes the first colon-split token as chat_id. Webhook
-        delivery keys embed ``webhook:{route}:{delivery}``. Keep the durable
-        ``session_key`` as the identity; only replace chat_id when the repaired
-        source rebuilds that exact key.
-        """
+        # The generic parser is intentionally lossy on extra colon slots. Use the
+        # durable session_key as identity and keep only a repair that round-trips.
         if self._process_event_source_key(source) == session_key:
             return source
         recovered = _chat_id_from_session_key(session_key, source)

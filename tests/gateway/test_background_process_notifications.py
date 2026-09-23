@@ -678,14 +678,7 @@ def _webhook_watch_event(session_key, **fields):
 
 @pytest.mark.asyncio
 async def test_closed_webhook_watch_event_keeps_delivery_identity_or_acks(monkeypatch, tmp_path):
-    """A background watch/completion for a closed one-shot webhook delivery must
-    not requeue forever after ``_parse_session_key`` strips colon-bearing ids.
-
-    Production: expected
-    ``agent:main:webhook:webhook:webhook:pump-pr-events:<delivery>:webhook:pump-pr-events``,
-    rebuilt ``agent:main:webhook:webhook:webhook:webhook:pump-pr-events``, then
-    ``Dropping internally routed event`` every drain.
-    """
+    """Closed webhook watch events keep the original delivery key or leave the queue."""
     runner, adapter = _closed_webhook_runner(monkeypatch, tmp_path)
     source = _webhook_delivery_source(adapter)
     expected_key = build_session_key(source)
